@@ -30,6 +30,12 @@ A Python EMA crossover trading bot for Bybit BTC/USDT spot market.
 - Bybit testnet blocks US-based IPs. Bot auto-falls back to mainnet for price data while keeping orders on testnet.
 - Telegram requires the user to send `/start` to the bot before notifications work.
 
+## GitHub
+- Repository: https://github.com/artyr180598-gif/bybit-trading-bot
+- Files pushed: `bot/trading_bot.py`, `bot/requirements.txt`, `.gitignore`, `replit.md`
+- GitHub integration was declined; files are pushed via GitHub REST API using `GITHUB_TOKEN` secret.
+- To push future changes, use the GitHub Contents API (`PUT /repos/{owner}/{repo}/contents/{path}`) with the `GITHUB_TOKEN` secret. You must fetch the current file SHA first when updating an existing file.
+
 
 
 ## Overview
