@@ -1,0 +1,9 @@
+pybit==5.14.0
+pandas==3.0.1
+requests==2.32.5
+python-dotenv==1.2.2
+numpy==2.4.3
+websocket-client==1.9.0
+pycryptodome==3.23.0
+python-dateutil==2.9.0.post0
+urllib3==2.6.3
