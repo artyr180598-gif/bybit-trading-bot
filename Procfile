@@ -1,1 +1,1 @@
-worker: python bot/trading_bot.py
+web: python run_grid_bot.py
