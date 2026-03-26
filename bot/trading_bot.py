@@ -8,7 +8,7 @@ Strategy:
 - Trend filter:  EMA 50 > EMA 200 (only trade with trend)
 - Entry signal:  Williams %R < -80 (oversold) + MACD bullish cross
 - Exit signal:   Williams %R > -20 (overbought) OR MACD bearish cross
-- Stop-loss:     Dynamic ATR-based (1.5x ATR below entry)
+- stop_loss_multiplier = 1.5
 - Risk:          2% of balance per trade
   Notifications: Telegram (per pair)
   Mode: PAPER_TRADE = True (safe simulation)
