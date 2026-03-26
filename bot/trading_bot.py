@@ -12,8 +12,6 @@ Strategy:
 - Risk:          2% of balance per trade
   Notifications: Telegram (per pair)
   Mode: PAPER_TRADE = True (safe simulation)
-  “””
-
 import os
 import time
 import logging
