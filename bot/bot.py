@@ -1,11 +1,26 @@
+"""
+CryptoBot Pro v3 — профессиональный инвестиционный бот.
+
+Торговая стратегия (цель: 80-120% годовых при min просадке):
+  Вход  : EMA-тренд + ADX(сила тренда >25) + Williams%R из перепроданности
+           + MACD гистограмма разворот + RSI в зоне импульса + объём выше среднего
+  Выход : Trailing-stop (ATR×1.5, тянется вверх) + Take-profit (ATR×3)
+           + RSI перекупленность + MACD разворот + тренд сломан
+  Риск  : 2% капитала на сделку, max 2 позиции одновременно,
+           дневной circuit-breaker (−8% → пауза 24ч),
+           глобальный стоп (−20% от пика → полная пауза)
+"""
+
 import os
 import sys
 import time
 import json
+import random
+import string
 import logging
 import requests
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 logging.basicConfig(
@@ -15,54 +30,80 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Конфигурация ──────────────────────────────────────────────────────────────
 TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 ADMIN_IDS = os.environ.get("ADMIN_IDS", ADMIN_ID)
 WALLET    = os.environ.get("USDT_WALLET", "ЗАДАЙТЕ_USDT_WALLET_В_SECRETS")
-BYBIT_KEY = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_SEC = os.environ.get("BYBIT_API_SECRET", "")
 
 DATA_DIR    = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 USERS_FILE  = DATA_DIR / "users.json"
 TRADES_FILE = DATA_DIR / "bot_trades.jsonl"
+REFS_FILE   = DATA_DIR / "referrals.json"
+DAILY_FILE  = DATA_DIR / "daily_stats.json"
 
 PAIRS = [
-    {"symbol": "BTCUSDT", "yahoo": "BTC-USD", "name": "BTC"},
-    {"symbol": "ETHUSDT", "yahoo": "ETH-USD", "name": "ETH"},
-    {"symbol": "SOLUSDT", "yahoo": "SOL-USD", "name": "SOL"},
+    {"symbol": "BTCUSDT", "yahoo": "BTC-USD", "name": "BTC", "emoji": "₿"},
+    {"symbol": "ETHUSDT", "yahoo": "ETH-USD", "name": "ETH", "emoji": "Ξ"},
+    {"symbol": "SOLUSDT", "yahoo": "SOL-USD", "name": "SOL", "emoji": "◎"},
 ]
 
-EMA_FAST       = 50
-EMA_SLOW       = 200
-WR_PERIOD      = 14
-WR_OVERSOLD    = -80
-WR_OVERBOUGHT  = -20
-MACD_FAST      = 12
-MACD_SLOW      = 26
-MACD_SIG       = 9
-ATR_PERIOD     = 14
-ATR_MULT       = 1.5
-RSI_PERIOD     = 14
-RISK_PCT       = 2.0
-TRADE_INTERVAL = 1800
-CANDLES        = 250
-CMD_INTERVAL   = 3
+# ── Параметры стратегии ───────────────────────────────────────────────────────
+EMA_FAST     = 20
+EMA_MID      = 50
+EMA_SLOW     = 200
+WR_PERIOD    = 14
+WR_OVERSOLD  = -80
+WR_OB        = -20
+MACD_FAST    = 12
+MACD_SLOW    = 26
+MACD_SIG     = 9
+ADX_PERIOD   = 14
+ADX_MIN      = 25        # Только сильные тренды
+ATR_PERIOD   = 14
+ATR_SL_MULT  = 1.5      # Стоп-лосс: ATR × 1.5
+ATR_TP_MULT  = 3.0       # Тейк-профит: ATR × 3  →  R:R = 1:2
+ATR_TRAIL    = 1.2       # Trailing-stop шаг: ATR × 1.2
+RSI_PERIOD   = 14
+VOL_MA       = 20        # Среднее объёма для фильтра
+VOL_MULT     = 1.1       # Объём должен быть выше среднего × 1.1
+RISK_PCT     = 2.0       # % капитала бота на сделку
+MAX_POS      = 2         # Максимум открытых позиций
+DAY_LOSS_PCT = 8.0       # Circuit-breaker: потеря >8% за день → стоп
+GLOBAL_DD    = 20.0      # Глобальная просадка >20% от пика → стоп
+TRADE_INT    = 1800      # Интервал торговых проверок: 30 минут
+CANDLES      = 300       # История свечей для расчётов
+CMD_INT      = 3         # Интервал опроса Telegram (сек)
+REPORT_INT   = 7         # Автоотчёт каждые N дней
 
+# ── Состояние ────────────────────────────────────────────────────────────────
 STATES         = {}
-LAST_UPDATE_ID = 0
+LAST_UPD_ID    = 0
 BOT_STATES     = {}
 
 
-def now_str():
+def ts():
     return datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
 
-def fmt(val, spec=",.2f"):
-    return format(val, spec)
+def fmt(v, spec=",.2f"):
+    return format(float(v), spec)
 
 
-# ── База пользователей ────────────────────────────────────────────────────────
+def sign(v):
+    return "+" if float(v) >= 0 else ""
+
+
+def pct(profit, base):
+    return (float(profit) / float(base) * 100) if float(base) > 0 else 0.0
+
+
+def wr_calc(wins, loss):
+    return round(wins / max(wins + loss, 1) * 100)
+
+
+# ── Пользователи ─────────────────────────────────────────────────────────────
 
 def load_users():
     if USERS_FILE.exists():
@@ -74,9 +115,9 @@ def load_users():
     return {}
 
 
-def save_users(users):
+def save_users(u):
     with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, indent=2, ensure_ascii=False, default=str)
+        json.dump(u, f, indent=2, ensure_ascii=False, default=str)
 
 
 def get_user(cid):
@@ -84,20 +125,27 @@ def get_user(cid):
     uid   = str(cid)
     if uid not in users:
         users[uid] = {
-            "id": uid, "name": "", "joined": now_str(),
+            "id": uid, "name": "", "joined": ts(),
             "demo": {
-                "balance": 1000.0, "start": 1000.0,
+                "balance": 1000.0, "start": 1000.0, "peak": 1000.0,
                 "profit": 0.0, "trades": 0, "wins": 0, "loss": 0,
-                "history": [],
+                "history": [], "streak_win": 0, "streak_loss": 0,
+                "max_dd": 0.0,
             },
             "real": {
-                "balance": 0.0, "deposited": 0.0,
+                "balance": 0.0, "deposited": 0.0, "peak": 0.0,
                 "profit": 0.0, "trades": 0, "wins": 0, "loss": 0,
-                "history": [], "active": False,
+                "history": [], "active": False, "autocompound": True,
                 "pending": 0.0, "pending_txid": "",
-                "withdrawals": [],
+                "withdrawals": [], "streak_win": 0, "streak_loss": 0,
+                "max_dd": 0.0,
             },
             "notify": True,
+            "ref_code": _gen_ref(),
+            "ref_by": None,
+            "ref_count": 0,
+            "ref_bonus": 0.0,
+            "last_seen": ts(),
         }
         save_users(users)
         logger.info("Новый пользователь: %s", uid)
@@ -114,7 +162,26 @@ def is_admin(cid):
     return str(cid) in [x.strip() for x in ADMIN_IDS.split(",") if x.strip()]
 
 
-# ── Состояние торгового бота ──────────────────────────────────────────────────
+def _gen_ref():
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+
+def load_refs():
+    if REFS_FILE.exists():
+        try:
+            with open(REFS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_refs(r):
+    with open(REFS_FILE, "w", encoding="utf-8") as f:
+        json.dump(r, f, indent=2, ensure_ascii=False, default=str)
+
+
+# ── Состояние бота ────────────────────────────────────────────────────────────
 
 def load_bot_state(sym):
     f = DATA_DIR / (sym + "_state.json")
@@ -124,8 +191,12 @@ def load_bot_state(sym):
                 return json.load(fp)
         except Exception:
             pass
-    return {"usdt": 10000.0, "coin": 0.0, "pos": None,
-            "n": 0, "wins": 0, "loss": 0, "pnl": 0.0}
+    return {
+        "usdt": 10000.0, "coin": 0.0, "pos": None,
+        "n": 0, "wins": 0, "loss": 0, "pnl": 0.0,
+        "peak": 10000.0, "day_start": 10000.0,
+        "day_date": "", "halted": False, "halt_until": 0,
+    }
 
 
 def save_bot_state(sym, s):
@@ -152,6 +223,11 @@ def all_trades():
     return trades
 
 
+def active_positions():
+    count = sum(1 for s in BOT_STATES.values() if s.get("pos"))
+    return count
+
+
 # ── Telegram API ──────────────────────────────────────────────────────────────
 
 def api(method, data=None):
@@ -169,13 +245,13 @@ def api(method, data=None):
 def send(cid, text, buttons=None):
     if not TOKEN:
         return {}
-    data = {"chat_id": str(cid), "text": text, "parse_mode": "HTML"}
+    data = {"chat_id": str(cid), "text": text[:4000], "parse_mode": "HTML"}
     if buttons:
         data["reply_markup"] = json.dumps({"inline_keyboard": buttons})
-    result = api("sendMessage", data)
-    if not result.get("ok"):
-        logger.warning("sendMessage %s: %s", cid, result.get("description", ""))
-    return result
+    res = api("sendMessage", data)
+    if not res.get("ok"):
+        logger.warning("sendMessage %s: %s", cid, res.get("description", ""))
+    return res
 
 
 def answer_cb(cb_id, text=""):
@@ -186,13 +262,15 @@ def answer_cb(cb_id, text=""):
 
 def kb_main():
     return [
-        [{"text": "👤 Мой аккаунт",    "callback_data": "account"},
-         {"text": "📊 Статистика",      "callback_data": "stats"}],
-        [{"text": "💰 Пополнить",       "callback_data": "deposit"},
-         {"text": "💸 Вывести",         "callback_data": "withdraw"}],
-        [{"text": "📈 История сделок",  "callback_data": "history"},
-         {"text": "❓ Помощь",          "callback_data": "help"}],
-        [{"text": "🔔 Уведомления вкл/выкл", "callback_data": "toggle_notify"}],
+        [{"text": "👤 Аккаунт",         "callback_data": "account"},
+         {"text": "📊 Статистика",       "callback_data": "stats"}],
+        [{"text": "🌐 Рынок сейчас",     "callback_data": "market"},
+         {"text": "📈 Мои сделки",       "callback_data": "history"}],
+        [{"text": "💰 Пополнить",        "callback_data": "deposit"},
+         {"text": "💸 Вывести",          "callback_data": "withdraw"}],
+        [{"text": "🤝 Реферальная программа", "callback_data": "referral"}],
+        [{"text": "❓ Как это работает", "callback_data": "help"},
+         {"text": "🔔 Уведомления",      "callback_data": "toggle_notify"}],
     ]
 
 
@@ -200,6 +278,8 @@ def kb_account():
     return [
         [{"text": "🎮 Демо-счёт",       "callback_data": "demo"},
          {"text": "💼 Реальный счёт",   "callback_data": "real"}],
+        [{"text": "📊 Моя статистика",  "callback_data": "my_stats"},
+         {"text": "🏆 Лидерборд",       "callback_data": "leaderboard"}],
         [{"text": "💰 Пополнить",       "callback_data": "deposit"},
          {"text": "💸 Вывести",         "callback_data": "withdraw"}],
         [{"text": "🏠 Главное меню",    "callback_data": "menu"}],
@@ -231,54 +311,43 @@ def kb_back():
 
 def kb_admin():
     return [
-        [{"text": "👥 Пользователи",      "callback_data": "adm_users"},
-         {"text": "📊 Статистика",        "callback_data": "adm_stats"}],
-        [{"text": "💰 Депозиты",          "callback_data": "adm_deposits"},
-         {"text": "💸 Выводы",            "callback_data": "adm_withdrawals"}],
-        [{"text": "📢 Рассылка",          "callback_data": "adm_broadcast"}],
-        [{"text": "🏠 Главное меню",      "callback_data": "menu"}],
+        [{"text": "👥 Пользователи",       "callback_data": "adm_users"},
+         {"text": "📊 Бот статистика",     "callback_data": "adm_stats"}],
+        [{"text": "💰 Депозиты",           "callback_data": "adm_deposits"},
+         {"text": "💸 Выводы",             "callback_data": "adm_withdrawals"}],
+        [{"text": "📢 Рассылка",           "callback_data": "adm_broadcast"},
+         {"text": "📋 Все сделки",         "callback_data": "adm_trades"}],
+        [{"text": "🏠 Главное меню",       "callback_data": "menu"}],
     ]
-
-
-# ── Вспомогательные функции ───────────────────────────────────────────────────
-
-def pct(profit, start):
-    return (profit / start * 100) if start > 0 else 0.0
-
-
-def wr(wins, loss):
-    return round(wins / max(wins + loss, 1) * 100)
-
-
-def sign(val):
-    return "+" if val >= 0 else ""
 
 
 # ── Экраны ────────────────────────────────────────────────────────────────────
 
 def screen_main(cid):
     try:
-        user        = get_user(cid)
-        d           = user["demo"]
-        r           = user["real"]
-        d_profit    = d["balance"] - d["start"]
-        d_pct       = pct(d_profit, d["start"])
-        r_pct       = pct(r["profit"], r["deposited"])
-        notify_txt  = "включены 🔔" if user.get("notify", True) else "выключены 🔕"
-        status_txt  = "✅ Активен" if r["active"] else "⏸ Неактивен"
+        user = get_user(cid)
+        user["last_seen"] = ts()
+        save_user(cid, user)
+        d       = user["demo"]
+        r       = user["real"]
+        d_pct   = pct(d["balance"] - d["start"], d["start"])
+        r_pct   = pct(r["profit"], r["deposited"])
+        ntf     = "🔔 вкл" if user.get("notify", True) else "🔕 выкл"
+        s_real  = "✅ Активен" if r["active"] else "⏸ Неактивен"
+        open_pos = sum(1 for s in BOT_STATES.values() if s.get("pos"))
 
         text = (
             "🤖 <b>CryptoBot Pro</b>\n"
-            + "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             + "Привет, <b>" + user["name"] + "</b>! 👋\n\n"
-            + "🎮 <b>Демо-счёт:</b>  $" + fmt(d["balance"])
-            + "  (" + sign(d_pct) + fmt(d_pct, ".1f") + "%)\n"
-            + "💼 <b>Реальный:</b>   $" + fmt(r["balance"])
-            + "  (" + sign(r_pct) + fmt(r_pct, ".1f") + "%)\n"
-            + "📌 <b>Статус:</b>     " + status_txt + "\n\n"
-            + "📊 Стратегия: EMA50/200 + WR + MACD + ATR\n"
-            + "⏱ Таймфрейм: 30 мин  |  ⚠️ Риск: 2%\n\n"
-            + "Уведомления: " + notify_txt
+            + "🎮 Демо:     <b>$" + fmt(d["balance"]) + "</b>"
+            + "  <code>" + sign(d_pct) + fmt(d_pct, ".1f") + "%</code>\n"
+            + "💼 Реальный: <b>$" + fmt(r["balance"]) + "</b>"
+            + "  <code>" + sign(r_pct) + fmt(r_pct, ".1f") + "%</code>\n"
+            + "📌 Статус:   " + s_real + "\n"
+            + "📡 Позиций открыто: " + str(open_pos) + " из " + str(MAX_POS) + "\n\n"
+            + "⚡ Стратегия: EMA+ADX+WR+MACD+ATR | Risk: 2% | RR: 1:2\n"
+            + "Уведомления: " + ntf
         )
         send(cid, text, kb_main())
     except Exception as e:
@@ -287,34 +356,133 @@ def screen_main(cid):
 
 
 def screen_account(cid):
-    user    = get_user(cid)
-    d       = user["demo"]
-    r       = user["real"]
-    d_pct   = pct(d["balance"] - d["start"], d["start"])
-    r_pct   = pct(r["profit"], r["deposited"])
+    user  = get_user(cid)
+    d     = user["demo"]
+    r     = user["real"]
+    d_pct = pct(d["balance"] - d["start"], d["start"])
+    r_pct = pct(r["profit"], r["deposited"])
+    d_dd  = d.get("max_dd", 0)
+    r_dd  = r.get("max_dd", 0)
 
     text = (
         "👤 <b>Мой аккаунт</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         + "🎮 <b>Демо-счёт</b>\n"
-        + "  Баланс:  <b>$" + fmt(d["balance"]) + "</b>\n"
-        + "  Прибыль: <code>" + sign(d["balance"] - d["start"]) + fmt(d["balance"] - d["start"])
-        + " USD (" + sign(d_pct) + fmt(d_pct, ".1f") + "%)</code>\n"
-        + "  Сделок:  " + str(d["trades"])
-        + "  |  W:" + str(d["wins"]) + " L:" + str(d["loss"])
-        + " (" + str(wr(d["wins"], d["loss"])) + "%)\n\n"
+        + "  Баланс:      <b>$" + fmt(d["balance"]) + "</b>\n"
+        + "  Прибыль:     <code>" + sign(d["balance"] - d["start"]) + fmt(d["balance"] - d["start"])
+        + " (" + sign(d_pct) + fmt(d_pct, ".1f") + "%)</code>\n"
+        + "  Макс.просадка: " + fmt(d_dd, ".1f") + "%\n"
+        + "  Сделок: " + str(d["trades"])
+        + "  W:" + str(d["wins"]) + " L:" + str(d["loss"])
+        + " (" + str(wr_calc(d["wins"], d["loss"])) + "%)\n\n"
         + "💼 <b>Реальный счёт</b>\n"
-        + "  Баланс:  <b>$" + fmt(r["balance"]) + "</b>\n"
-        + "  Внесено: $" + fmt(r["deposited"]) + "\n"
-        + "  Прибыль: <code>" + sign(r["profit"]) + fmt(r["profit"])
-        + " USD (" + sign(r_pct) + fmt(r_pct, ".1f") + "%)</code>\n"
-        + "  Сделок:  " + str(r["trades"])
-        + "  |  W:" + str(r["wins"]) + " L:" + str(r["loss"])
-        + " (" + str(wr(r["wins"], r["loss"])) + "%)\n"
-        + "  Статус:  " + ("✅ Активен" if r["active"] else "⏸ Неактивен") + "\n\n"
+        + "  Баланс:      <b>$" + fmt(r["balance"]) + "</b>\n"
+        + "  Внесено:     $" + fmt(r["deposited"]) + "\n"
+        + "  Прибыль:     <code>" + sign(r["profit"]) + fmt(r["profit"])
+        + " (" + sign(r_pct) + fmt(r_pct, ".1f") + "%)</code>\n"
+        + "  Макс.просадка: " + fmt(r_dd, ".1f") + "%\n"
+        + "  Сделок: " + str(r["trades"])
+        + "  W:" + str(r["wins"]) + " L:" + str(r["loss"])
+        + " (" + str(wr_calc(r["wins"], r["loss"])) + "%)\n"
+        + "  Автореинвест: " + ("✅ вкл" if r.get("autocompound", True) else "❌ выкл") + "\n"
+        + "  Статус:      " + ("✅ Активен" if r["active"] else "⏸ Неактивен") + "\n\n"
+        + "🤝 Рефералов: " + str(user.get("ref_count", 0))
+        + "  Реф.бонус: $" + fmt(user.get("ref_bonus", 0)) + "\n"
         + "📅 Регистрация: " + user["joined"]
     )
     send(cid, text, kb_account())
+
+
+def screen_my_stats(cid):
+    user    = get_user(cid)
+    d       = user["demo"]
+    r       = user["real"]
+    all_t   = all_trades()
+    # Примерный расчёт Sharpe (упрощённый на основе истории пользователя)
+    hist    = r["history"] + d["history"]
+    pnls    = [t.get("pnl", 0) for t in hist if t.get("pnl") is not None]
+    sharpe  = "—"
+    if len(pnls) >= 5:
+        import statistics
+        mean_r = statistics.mean(pnls)
+        std_r  = statistics.stdev(pnls) if len(pnls) > 1 else 1
+        sharpe = fmt(mean_r / max(std_r, 0.001), ".2f") if std_r > 0 else "—"
+
+    d_streak = d.get("streak_win", 0)
+    r_streak = r.get("streak_win", 0)
+
+    text = (
+        "📊 <b>Персональная статистика</b>\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "🎮 <b>Демо-счёт</b>\n"
+        + "  Winrate:         " + str(wr_calc(d["wins"], d["loss"])) + "%\n"
+        + "  Макс. серия побед: " + str(d_streak) + "\n"
+        + "  Макс. просадка:   " + fmt(d.get("max_dd", 0), ".1f") + "%\n"
+        + "  Всего сделок:     " + str(d["trades"]) + "\n\n"
+        + "💼 <b>Реальный счёт</b>\n"
+        + "  Winrate:          " + str(wr_calc(r["wins"], r["loss"])) + "%\n"
+        + "  Макс. серия побед:" + str(r_streak) + "\n"
+        + "  Макс. просадка:   " + fmt(r.get("max_dd", 0), ".1f") + "%\n"
+        + "  Прибыль/мес (ср): " + _monthly_avg(r["history"]) + "\n"
+        + "  Всего сделок:     " + str(r["trades"]) + "\n"
+        + "  Sharpe (approx):  " + sharpe + "\n\n"
+        + "📅 Дата регистрации: " + user["joined"]
+    )
+    send(cid, text, kb_back())
+
+
+def _monthly_avg(history):
+    if not history:
+        return "$0.00"
+    pnls = [t.get("pnl", 0) for t in history]
+    months = max(len(history) / 30.0, 1)
+    avg    = sum(pnls) / months
+    return sign(avg) + "$" + fmt(avg, ".2f")
+
+
+def screen_leaderboard(cid):
+    users = load_users()
+    rows  = []
+    for uid, u in users.items():
+        r = u["real"]
+        if r["deposited"] > 0:
+            p = pct(r["profit"], r["deposited"])
+            rows.append((uid, u.get("name", "—"), p, r["balance"]))
+    rows.sort(key=lambda x: x[2], reverse=True)
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    text   = "🏆 <b>Лидерборд — топ инвесторов</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    if not rows:
+        text += "Пока нет активных инвесторов"
+    else:
+        for i, (uid, name, p, bal) in enumerate(rows[:10]):
+            med   = medals[i] if i < 5 else str(i + 1) + "."
+            me    = " ← вы" if uid == str(cid) else ""
+            text += med + " <b>" + name + "</b>  " + sign(p) + fmt(p, ".1f") + "%" + me + "\n"
+    send(cid, text, kb_back())
+
+
+def screen_market(cid):
+    text  = "🌐 <b>Рынок сейчас</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for pair in PAIRS:
+        price = fetch_price(pair["yahoo"])
+        s     = BOT_STATES.get(pair["symbol"], {})
+        pos   = s.get("pos")
+        pos_txt = ""
+        if pos:
+            fl     = (price - pos["entry"]) * s.get("coin", 0) if price else 0
+            fl_pct = ((price - pos["entry"]) / pos["entry"] * 100) if (price and pos["entry"]) else 0
+            pos_txt = (
+                "\n  📍 Позиция: вход $" + fmt(pos["entry"])
+                + "\n  💰 Float P&L: <code>" + sign(fl) + fmt(fl) + " USD (" + sign(fl_pct) + fmt(fl_pct, ".1f") + "%)</code>"
+                + "\n  🛡 Стоп: $" + fmt(pos.get("sl", 0))
+                + " | 🎯 TP: $" + fmt(pos.get("tp", 0))
+            )
+        price_txt = "$" + fmt(price) if price else "нет данных"
+        text += pair["emoji"] + " <b>" + pair["name"] + "</b>  " + price_txt + pos_txt + "\n\n"
+    text += "⏱ Обновляется каждые 30 минут\n"
+    text += "📡 Стратегия ищет точки входа 24/7"
+    send(cid, text, kb_back())
 
 
 def screen_demo(cid):
@@ -322,24 +490,25 @@ def screen_demo(cid):
     d     = user["demo"]
     d_pct = pct(d["balance"] - d["start"], d["start"])
     hist  = ""
-    for t in reversed(d["history"][-5:]):
+    for t in reversed(d["history"][-6:]):
         p    = t.get("pnl", 0)
         icon = "✅" if p >= 0 else "❌"
         hist += "\n" + icon + " " + sign(p) + fmt(p) + " USD  " + t.get("pair", "") + "  " + t.get("time", "")[:10]
 
     text = (
         "🎮 <b>Демо-счёт</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "💵 Баланс:  <b>$" + fmt(d["balance"]) + "</b>\n"
-        + "🚀 Старт:   $" + fmt(d["start"]) + "\n"
-        + "📈 Прибыль: <code>" + sign(d["balance"] - d["start"]) + fmt(d["balance"] - d["start"])
-        + " USD (" + sign(d_pct) + fmt(d_pct, ".1f") + "%)</code>\n"
-        + "🔢 Сделок:  " + str(d["trades"])
-        + "  |  W:" + str(d["wins"]) + " L:" + str(d["loss"])
-        + " (" + str(wr(d["wins"], d["loss"])) + "% побед)\n\n"
-        + "<b>Последние 5 сделок:</b>"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "💵 Баланс:     <b>$" + fmt(d["balance"]) + "</b>\n"
+        + "🚀 Старт:      $" + fmt(d["start"]) + "\n"
+        + "📈 Прибыль:    <code>" + sign(d["balance"] - d["start"])
+        + fmt(d["balance"] - d["start"]) + " (" + sign(d_pct) + fmt(d_pct, ".1f") + "%)</code>\n"
+        + "📉 Макс.просадка: " + fmt(d.get("max_dd", 0), ".1f") + "%\n"
+        + "🔢 Сделок: " + str(d["trades"])
+        + "  W:" + str(d["wins"]) + " L:" + str(d["loss"])
+        + " (" + str(wr_calc(d["wins"], d["loss"])) + "%)\n\n"
+        + "<b>Последние 6 сделок:</b>"
         + (hist if hist else "\nСделок пока нет") + "\n\n"
-        + "ℹ️ Демо: $1 000 виртуально — та же стратегия"
+        + "ℹ️ $1 000 виртуально — тот же алгоритм"
     )
     send(cid, text, kb_back())
 
@@ -349,42 +518,46 @@ def screen_real(cid):
     r      = user["real"]
     r_pct  = pct(r["profit"], r["deposited"])
     hist   = ""
-    for t in reversed(r["history"][-5:]):
+    for t in reversed(r["history"][-6:]):
         p    = t.get("pnl", 0)
         icon = "✅" if p >= 0 else "❌"
         hist += "\n" + icon + " " + sign(p) + fmt(p) + " USD  " + t.get("pair", "") + "  " + t.get("time", "")[:10]
-    status = "✅ Активен — бот торгует вашими средствами" if r["active"] else "⏸ Неактивен — пополните счёт"
-
+    status = "✅ Активен" if r["active"] else "⏸ Неактивен — пополните счёт"
+    btns = [
+        [{"text": "💰 Пополнить",      "callback_data": "deposit"},
+         {"text": "💸 Вывести",        "callback_data": "withdraw"}],
+        [{"text": "🔄 Автореинвест: " + ("✅" if r.get("autocompound", True) else "❌"),
+          "callback_data": "toggle_compound"}],
+        [{"text": "🏠 Главное меню",   "callback_data": "menu"}],
+    ]
     text = (
         "💼 <b>Реальный счёт</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "📌 Статус:  " + status + "\n"
-        + "💵 Баланс:  <b>$" + fmt(r["balance"]) + "</b>\n"
-        + "📥 Внесено: $" + fmt(r["deposited"]) + "\n"
-        + "📈 Прибыль: <code>" + sign(r["profit"]) + fmt(r["profit"])
-        + " USD (" + sign(r_pct) + fmt(r_pct, ".1f") + "%)</code>\n"
-        + "🔢 Сделок:  " + str(r["trades"])
-        + "  |  W:" + str(r["wins"]) + " L:" + str(r["loss"])
-        + " (" + str(wr(r["wins"], r["loss"])) + "% побед)\n\n"
-        + "<b>Последние 5 сделок:</b>"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "📌 Статус:      " + status + "\n"
+        + "💵 Баланс:      <b>$" + fmt(r["balance"]) + "</b>\n"
+        + "📥 Внесено:     $" + fmt(r["deposited"]) + "\n"
+        + "📈 Прибыль:     <code>" + sign(r["profit"]) + fmt(r["profit"])
+        + " (" + sign(r_pct) + fmt(r_pct, ".1f") + "%)</code>\n"
+        + "📉 Макс.просадка: " + fmt(r.get("max_dd", 0), ".1f") + "%\n"
+        + "🔄 Автореинвест: " + ("✅ прибыль реинвестируется" if r.get("autocompound", True) else "❌ прибыль не реинвестируется") + "\n"
+        + "🔢 Сделок: " + str(r["trades"])
+        + "  W:" + str(r["wins"]) + " L:" + str(r["loss"])
+        + " (" + str(wr_calc(r["wins"], r["loss"])) + "%)\n\n"
+        + "<b>Последние 6 сделок:</b>"
         + (hist if hist else "\nСделок пока нет")
     )
-    btns = [
-        [{"text": "💰 Пополнить",    "callback_data": "deposit"},
-         {"text": "💸 Вывести",      "callback_data": "withdraw"}],
-        [{"text": "🏠 Главное меню", "callback_data": "menu"}],
-    ]
     send(cid, text, btns)
 
 
 def screen_deposit(cid):
     text = (
         "💰 <b>Пополнение счёта</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "Выберите сумму пополнения:\n\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "Выберите сумму:\n\n"
         + "📌 Минимум: <b>$50 USDT</b>\n"
         + "🌐 Сеть: <b>TRC20 (Tron)</b>\n\n"
-        + "После пополнения бот сразу начнёт торговать 🚀"
+        + "💡 Чем больше депозит — тем больше\n"
+        + "   абсолютная прибыль с каждой сделки 🚀"
     )
     send(cid, text, kb_deposit())
 
@@ -392,15 +565,15 @@ def screen_deposit(cid):
 def screen_deposit_details(cid, amount):
     text = (
         "💰 <b>Пополнение на $" + str(int(amount)) + " USDT</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         + "Отправьте ровно <b>" + str(int(amount)) + " USDT</b>\n"
-        + "на кошелёк:\n\n"
+        + "на следующий кошелёк:\n\n"
         + "<code>" + WALLET + "</code>\n\n"
         + "🌐 Сеть: <b>TRC20 (Tron)</b>\n"
-        + "⚠️ Внимательно проверьте адрес!\n\n"
+        + "⚠️ Проверьте адрес — иные сети не поддерживаются!\n\n"
         + "После отправки нажмите кнопку ниже\n"
-        + "и введите TX-хэш транзакции.\n\n"
-        + "⏱ Зачисление: до 30 минут"
+        + "и введите TX-хэш (TXID) транзакции.\n\n"
+        + "⏱ Зачисление: <b>до 30 минут</b>"
     )
     send(cid, text, kb_confirm_dep(amount))
 
@@ -409,39 +582,50 @@ def screen_stats(cid):
     trades = all_trades()
     sells  = [t for t in trades if t.get("side") == "SELL"]
     total  = len(sells)
-    wins   = len([t for t in sells if t.get("pnl", 0) >= 0])
-    wr_pct = round(wins / max(total, 1) * 100)
+    wins_n = len([t for t in sells if t.get("pnl", 0) >= 0])
+    wr_pct = round(wins_n / max(total, 1) * 100)
     pnl    = sum(t.get("pnl", 0) for t in sells)
+    avg_w  = sum(t.get("pnl", 0) for t in sells if t.get("pnl", 0) >= 0) / max(wins_n, 1)
+    avg_l  = sum(t.get("pnl", 0) for t in sells if t.get("pnl", 0) < 0) / max(total - wins_n, 1)
+    rr     = abs(avg_w / avg_l) if avg_l != 0 else 0
     users  = load_users()
     active = len([u for u in users.values() if u["real"]["active"]])
     dep    = sum(u["real"]["deposited"] for u in users.values())
 
+    # Circuit-breaker статус
+    halted = any(s.get("halted") for s in BOT_STATES.values())
+
     text = (
         "📊 <b>Статистика бота</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "<b>🤖 Результаты по парам:</b>\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "<b>📡 Позиции сейчас:</b>\n"
     )
     for pair in PAIRS:
-        s    = BOT_STATES.get(pair["symbol"], {})
-        fl   = ""
-        if s.get("pos"):
-            price = fetch_price(pair["yahoo"])
-            if price:
-                f  = (price - s["pos"]["entry"]) * s.get("coin", 0)
-                fl = "  Float: <code>" + sign(f) + fmt(f) + "$</code>"
-        w_r  = str(wr(s.get("wins", 0), s.get("loss", 0)))
+        s     = BOT_STATES.get(pair["symbol"], {})
+        w_r   = str(wr_calc(s.get("wins", 0), s.get("loss", 0)))
+        price = fetch_price(pair["yahoo"])
+        fl    = ""
+        if s.get("pos") and price:
+            f  = (price - s["pos"]["entry"]) * s.get("coin", 0)
+            fl = "  Float: <code>" + sign(f) + fmt(f) + "$</code>"
+        halt_txt = " ⛔СТОП" if s.get("halted") else ""
         text += (
-            pair["name"] + ": <code>" + sign(s.get("pnl", 0)) + fmt(s.get("pnl", 0)) + "$</code>"
-            + "  W:" + str(s.get("wins", 0)) + " L:" + str(s.get("loss", 0))
-            + " (" + w_r + "%)" + fl + "\n"
+            pair["emoji"] + " " + pair["name"] + halt_txt + ": <code>"
+            + sign(s.get("pnl", 0)) + fmt(s.get("pnl", 0)) + "$</code>"
+            + "  " + w_r + "% побед" + fl + "\n"
         )
+
     text += (
-        "\n<b>📈 Итого:</b>\n"
-        + "Закрытых сделок: " + str(total) + "  |  Побед: " + str(wr_pct) + "%\n"
-        + "Общая прибыль: <code>" + sign(pnl) + fmt(pnl) + " USD</code>\n\n"
+        "\n<b>📈 Итого по боту:</b>\n"
+        + "Сделок: " + str(total) + "  |  Winrate: " + str(wr_pct) + "%\n"
+        + "Avg.Win: $" + fmt(avg_w) + "  Avg.Loss: $" + fmt(avg_l) + "\n"
+        + "R:R реальный: 1:" + fmt(rr, ".1f") + "\n"
+        + "Общий P&L: <code>" + sign(pnl) + fmt(pnl) + " USD</code>\n"
+        + ("⛔ Торговля приостановлена (circuit breaker)\n" if halted else "") + "\n"
         + "<b>👥 Сообщество:</b>\n"
-        + "Активных инвесторов: " + str(active) + "\n"
-        + "Всего внесено: $" + fmt(dep)
+        + "Пользователей: " + str(len(users)) + "\n"
+        + "Активных: " + str(active) + "\n"
+        + "Внесено всего: $" + fmt(dep)
     )
     send(cid, text, kb_back())
 
@@ -451,11 +635,7 @@ def screen_history(cid):
     dh   = user["demo"]["history"][-10:]
     rh   = user["real"]["history"][-10:]
 
-    text = (
-        "📈 <b>История сделок</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "🎮 <b>Демо (последние 10):</b>\n"
-    )
+    text = "📈 <b>История сделок</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎮 <b>Демо (последние 10):</b>\n"
     if not dh:
         text += "Сделок пока нет\n"
     else:
@@ -479,22 +659,47 @@ def screen_history(cid):
 def screen_withdraw(cid):
     user = get_user(cid)
     bal  = user["real"]["balance"]
-    if bal <= 0:
+    if bal < 10:
         send(cid,
              "⚠️ <b>Вывод недоступен</b>\n\n"
-             + "На реальном счёте нет средств.\n"
-             + "Пополните счёт, чтобы начать торговлю.",
+             + "Минимальный баланс для вывода: $10\n"
+             + "Ваш баланс: $" + fmt(bal),
              kb_back())
         return
     STATES[str(cid)] = {"state": "wd_waiting"}
     text = (
         "💸 <b>Вывод средств</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         + "Доступно: <b>$" + fmt(bal) + " USDT</b>\n\n"
-        + "Введите кошелёк TRC20 и сумму:\n"
+        + "Введите TRC20-кошелёк и сумму:\n"
         + "Формат: <code>КОШЕЛЁК СУММА</code>\n"
-        + "Пример: <code>TXxxxxxxxx 100</code>\n\n"
-        + "Минимальная сумма вывода: $10"
+        + "Пример: <code>TXxxxxxxxx 150</code>\n\n"
+        + "📌 Минимальная сумма: $10\n"
+        + "⏱ Обработка: до 24 часов"
+    )
+    send(cid, text, kb_back())
+
+
+def screen_referral(cid):
+    user     = get_user(cid)
+    ref_code = user.get("ref_code", _gen_ref())
+    count    = user.get("ref_count", 0)
+    bonus    = user.get("ref_bonus", 0.0)
+    bot_info = api("getMe")
+    bot_name = bot_info.get("result", {}).get("username", "your_bot")
+    link     = "https://t.me/" + bot_name + "?start=ref_" + ref_code
+
+    text = (
+        "🤝 <b>Реферальная программа</b>\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "Приглашайте друзей и зарабатывайте!\n\n"
+        + "💰 Ваша ставка: <b>5% с прибыли реферала</b>\n"
+        + "   (начисляется автоматически при каждой сделке)\n\n"
+        + "🔗 Ваша ссылка:\n"
+        + "<code>" + link + "</code>\n\n"
+        + "📊 Ваши рефералы: <b>" + str(count) + "</b>\n"
+        + "💵 Реферальный доход: <b>$" + fmt(bonus) + "</b>\n\n"
+        + "Поделитесь ссылкой — зарабатывайте вместе! 🚀"
     )
     send(cid, text, kb_back())
 
@@ -502,30 +707,37 @@ def screen_withdraw(cid):
 def screen_help(cid):
     text = (
         "❓ <b>Как работает CryptoBot Pro</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         + "🎮 <b>Демо-счёт</b>\n"
-        + "• $1 000 виртуальных средств\n"
-        + "• Тест стратегии без риска\n"
-        + "• Тот же алгоритм, что на реальном\n\n"
+        + "• $1 000 виртуально — сразу после /start\n"
+        + "• Тот же алгоритм, что на реальном счёте\n"
+        + "• Проверьте стратегию без риска\n\n"
         + "💼 <b>Реальный счёт</b>\n"
-        + "• Минимальный депозит $50 USDT (TRC20)\n"
-        + "• Бот торгует автоматически 24/7\n"
+        + "• Минимальный депозит: $50 USDT TRC20\n"
+        + "• Бот торгует 24/7 автоматически\n"
         + "• Прибыль начисляется после каждой сделки\n"
         + "• Вывод доступен в любое время\n\n"
-        + "📊 <b>Торговая стратегия</b>\n"
-        + "• Пары: BTC, ETH, SOL\n"
-        + "• Таймфрейм: 30 минут\n"
-        + "• EMA 50/200 — фильтр тренда\n"
-        + "• Williams %R — сигнал входа\n"
-        + "• MACD — подтверждение\n"
-        + "• ATR × 1.5 — динамический стоп-лосс\n"
-        + "• RSI — фильтр перекупленности\n"
-        + "• Риск на сделку: 2%\n\n"
-        + "🔔 <b>Уведомления</b>\n"
-        + "Получайте оповещения о сделках.\n"
-        + "Вкл/выкл в главном меню.\n\n"
-        + "📞 <b>Поддержка</b>\n"
-        + "Напишите администратору."
+        + "📊 <b>Профессиональная стратегия</b>\n"
+        + "• Пары: BTC, ETH, SOL (30 мин таймфрейм)\n"
+        + "• EMA 20/50/200 — определение тренда\n"
+        + "• ADX > 25 — только сильные тренды\n"
+        + "• Williams %R — точки входа из перепроданности\n"
+        + "• MACD — подтверждение разворота\n"
+        + "• RSI 45-65 — зона импульса (не перекуплен)\n"
+        + "• Объём > среднего — подтверждение силы\n"
+        + "• Trailing-stop (ATR×1.5) — тянется за ценой\n"
+        + "• Take-profit ATR×3 — соотношение 1:2\n\n"
+        + "🛡 <b>Защита капитала</b>\n"
+        + "• Риск 2% на сделку\n"
+        + "• Макс. 2 позиции одновременно\n"
+        + "• Стоп при дневном убытке >8%\n"
+        + "• Глобальный стоп при просадке >20%\n\n"
+        + "🔄 <b>Автореинвест</b>\n"
+        + "Прибыль реинвестируется автоматически\n"
+        + "(можно отключить в разделе «Реальный счёт»)\n\n"
+        + "🤝 <b>Реферальная программа</b>\n"
+        + "Приглашайте друзей — получайте 5% от их прибыли\n\n"
+        + "📞 <b>Поддержка:</b> обратитесь к администратору"
     )
     send(cid, text, kb_back())
 
@@ -534,44 +746,45 @@ def screen_admin(cid):
     users  = load_users()
     active = len([u for u in users.values() if u["real"]["active"]])
     dep    = sum(u["real"]["deposited"] for u in users.values())
+    bal    = sum(u["real"]["balance"] for u in users.values())
     pend_d = len([u for u in users.values() if u["real"].get("pending", 0) > 0])
     pend_w = sum(
         1 for u in users.values()
         for req in u["real"].get("withdrawals", [])
         if req.get("status") == "pending"
     )
+    halted = any(s.get("halted") for s in BOT_STATES.values())
     text = (
         "🔧 <b>Панель администратора</b>\n"
-        + "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "👥 Всего пользователей:    <b>" + str(len(users)) + "</b>\n"
-        + "✅ Активных инвесторов:    <b>" + str(active) + "</b>\n"
-        + "💰 Всего внесено:          <b>$" + fmt(dep) + "</b>\n"
-        + "⏳ Ожид. депозитов:        <b>" + str(pend_d) + "</b>\n"
-        + "⏳ Ожид. выводов:          <b>" + str(pend_w) + "</b>"
+        + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        + "👥 Пользователей:      <b>" + str(len(users)) + "</b>\n"
+        + "✅ Активных:           <b>" + str(active) + "</b>\n"
+        + "💰 Внесено всего:      <b>$" + fmt(dep) + "</b>\n"
+        + "💼 Баланс у клиентов:  <b>$" + fmt(bal) + "</b>\n"
+        + "⏳ Ожид. депозитов:    <b>" + str(pend_d) + "</b>\n"
+        + "⏳ Ожид. выводов:      <b>" + str(pend_w) + "</b>\n"
+        + ("⛔ ТОРГОВЛЯ ОСТАНОВЛЕНА\n" if halted else "🟢 Торговля активна\n")
     )
     send(cid, text, kb_admin())
 
 
 def screen_admin_users(cid):
     users = load_users()
-    text  = "👥 <b>Пользователи (" + str(len(users)) + ")</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-    for uid, u in list(users.items())[:30]:
-        r     = u["real"]
+    text  = "👥 <b>Пользователи (" + str(len(users)) + ")</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for uid, u in list(users.items())[:25]:
+        r = u["real"]
         text += (
-            "<b>" + u.get("name", "—") + "</b>  (<code>" + uid + "</code>)\n"
+            "<b>" + u.get("name", "—") + "</b>  <code>" + uid + "</code>\n"
             + "  Реал: $" + fmt(r["balance"])
             + " | Деп: $" + fmt(r["deposited"])
-            + " | " + ("✅" if r["active"] else "⏸") + "\n"
-            + "  Демо: $" + fmt(u["demo"]["balance"]) + "\n\n"
+            + " | " + ("✅" if r["active"] else "⏸") + "\n\n"
         )
-    if len(users) > 30:
-        text += "... ещё " + str(len(users) - 30) + "\n"
     send(cid, text, [[{"text": "◀️ Назад", "callback_data": "admin"}]])
 
 
 def screen_admin_deposits(cid):
     users = load_users()
-    text  = "💰 <b>Ожидающие депозиты</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    text  = "💰 <b>Ожидающие депозиты</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     found = False
     btns  = []
     for uid, u in users.items():
@@ -580,9 +793,9 @@ def screen_admin_deposits(cid):
             amt   = u["real"]["pending"]
             txid  = u["real"].get("pending_txid", "нет")
             text += (
-                "<b>" + u.get("name", "—") + "</b>  (<code>" + uid + "</code>)\n"
+                "<b>" + u.get("name", "—") + "</b>  <code>" + uid + "</code>\n"
                 + "Сумма: <b>$" + fmt(amt) + "</b>\n"
-                + "TXID: <code>" + str(txid)[:30] + "</code>\n\n"
+                + "TXID: <code>" + str(txid)[:32] + "</code>\n\n"
             )
             btns.append([{"text": "✅ Подтвердить $" + str(int(amt)) + " — " + u.get("name", uid),
                            "callback_data": "admconfirm_" + uid + "_" + str(amt)}])
@@ -594,7 +807,7 @@ def screen_admin_deposits(cid):
 
 def screen_admin_withdrawals(cid):
     users = load_users()
-    text  = "💸 <b>Ожидающие выводы</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    text  = "💸 <b>Ожидающие выводы</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     found = False
     btns  = []
     for uid, u in users.items():
@@ -602,7 +815,7 @@ def screen_admin_withdrawals(cid):
             if req.get("status") == "pending":
                 found = True
                 text += (
-                    "<b>" + u.get("name", "—") + "</b>  (<code>" + uid + "</code>)\n"
+                    "<b>" + u.get("name", "—") + "</b>  <code>" + uid + "</code>\n"
                     + "Сумма: <b>$" + fmt(req["amount"]) + "</b>\n"
                     + "Кошелёк: <code>" + req["wallet"] + "</code>\n\n"
                 )
@@ -614,7 +827,26 @@ def screen_admin_withdrawals(cid):
     send(cid, text, btns)
 
 
-# ── Распределение прибыли ─────────────────────────────────────────────────────
+def screen_admin_trades(cid):
+    trades = all_trades()
+    sells  = [t for t in trades if t.get("side") == "SELL"][-15:]
+    text   = "📋 <b>Последние 15 сделок</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    if not sells:
+        text += "Сделок пока нет"
+    else:
+        for t in reversed(sells):
+            p    = t.get("pnl", 0)
+            icon = "✅" if p >= 0 else "❌"
+            text += (
+                icon + " " + t.get("pair", "") + "  "
+                + "<code>" + sign(p) + fmt(p) + "$</code>  "
+                + t.get("reason", "") + "  "
+                + t.get("time", "")[:10] + "\n"
+            )
+    send(cid, text, [[{"text": "◀️ Назад", "callback_data": "admin"}]])
+
+
+# ── Распределение прибыли с реферальными бонусами ────────────────────────────
 
 def distribute(pair_name, pnl, is_win):
     try:
@@ -623,61 +855,129 @@ def distribute(pair_name, pnl, is_win):
             u["real"]["balance"] for u in users.values()
             if u["real"]["active"] and u["real"]["balance"] > 0
         )
-        ts      = now_str()
-        changed = False
+        now = ts()
         for uid, user in users.items():
             r = user["real"]
             d = user["demo"]
+
+            # ── Реальный счёт ──
             if r["active"] and r["balance"] > 0 and total_real > 0:
                 share    = r["balance"] / total_real
                 user_pnl = round(pnl * share, 4)
+
                 r["balance"] += user_pnl
                 r["profit"]  += user_pnl
                 r["trades"]  += 1
+
+                # Обновление пика для расчёта просадки
+                if r["balance"] > r.get("peak", 0):
+                    r["peak"] = r["balance"]
+                dd = pct(r.get("peak", r["balance"]) - r["balance"], r.get("peak", r["balance"]))
+                if dd > r.get("max_dd", 0):
+                    r["max_dd"] = dd
+
+                # Серия побед/поражений
                 if is_win:
-                    r["wins"] += 1
+                    r["wins"]         += 1
+                    r["streak_win"]    = r.get("streak_win", 0) + 1
+                    r["streak_loss"]   = 0
                 else:
-                    r["loss"] += 1
-                r["history"].append({"pair": pair_name, "pnl": user_pnl, "time": ts, "type": "real"})
+                    r["loss"]         += 1
+                    r["streak_loss"]   = r.get("streak_loss", 0) + 1
+                    r["streak_win"]    = 0
+
+                r["history"].append({"pair": pair_name, "pnl": user_pnl, "time": now})
                 if len(r["history"]) > 200:
                     r["history"] = r["history"][-200:]
+
+                # Реферальный бонус рефереру (5% от прибыли реферала)
+                ref_by = user.get("ref_by")
+                if ref_by and user_pnl > 0 and ref_by in users:
+                    bonus = round(user_pnl * 0.05, 4)
+                    users[ref_by]["real"]["balance"] += bonus
+                    users[ref_by]["ref_bonus"]        = users[ref_by].get("ref_bonus", 0) + bonus
+                    users[ref_by]["real"]["profit"]   += bonus
+
                 if user.get("notify", True) and user_pnl != 0:
                     icon = "✅ ПРИБЫЛЬ" if user_pnl >= 0 else "❌ УБЫТОК"
-                    send(
-                        uid,
-                        icon + " — <b>" + pair_name + "</b>\n"
-                        + "Ваша доля: <code>" + sign(user_pnl) + fmt(user_pnl) + " USD</code>\n"
-                        + "Баланс: <b>$" + fmt(r["balance"]) + "</b>",
-                        [[{"text": "💼 Мой счёт", "callback_data": "real"}]],
-                    )
-                changed = True
+                    send(uid,
+                         icon + " — <b>" + pair_name + "</b>\n"
+                         + "Ваша доля: <code>" + sign(user_pnl) + fmt(user_pnl) + " USD</code>\n"
+                         + "Баланс: <b>$" + fmt(r["balance"]) + "</b>",
+                         [[{"text": "💼 Мой счёт", "callback_data": "real"}]])
+
+            # ── Демо-счёт (пропорционально) ──
             else:
                 share    = d["balance"] / 1000.0 if d["balance"] > 0 else 0
                 demo_pnl = round(pnl * share * 0.05, 4)
                 d["balance"] += demo_pnl
                 d["profit"]  += demo_pnl
                 d["trades"]  += 1
+                if d["balance"] > d.get("peak", d["balance"]):
+                    d["peak"] = d["balance"]
+                dd = pct(d.get("peak", d["balance"]) - d["balance"], d.get("peak", d["balance"]))
+                if dd > d.get("max_dd", 0):
+                    d["max_dd"] = dd
                 if is_win:
                     d["wins"] += 1
+                    d["streak_win"]  = d.get("streak_win", 0) + 1
+                    d["streak_loss"] = 0
                 else:
                     d["loss"] += 1
-                d["history"].append({"pair": pair_name, "pnl": demo_pnl, "time": ts, "type": "demo"})
+                    d["streak_loss"] = d.get("streak_loss", 0) + 1
+                    d["streak_win"]  = 0
+                d["history"].append({"pair": pair_name, "pnl": demo_pnl, "time": now})
                 if len(d["history"]) > 200:
                     d["history"] = d["history"][-200:]
-                changed = True
+
             users[uid] = user
-        if changed:
-            save_users(users)
+        save_users(users)
     except Exception as e:
         logger.error("distribute: %s", e)
 
 
-# ── Рыночные данные и индикаторы ──────────────────────────────────────────────
+# ── Автоматический еженедельный отчёт ────────────────────────────────────────
 
-def fetch_candles(sym):
+def weekly_report():
+    try:
+        users   = load_users()
+        trades  = all_trades()
+        sells   = [t for t in trades if t.get("side") == "SELL"]
+        total   = len(sells)
+        wins    = len([t for t in sells if t.get("pnl", 0) >= 0])
+        wr_pct  = round(wins / max(total, 1) * 100)
+        week_pnl = sum(t.get("pnl", 0) for t in sells[-48:])  # ~48 сделок за неделю
+
+        for uid, user in users.items():
+            try:
+                r      = user["real"]
+                d      = user["demo"]
+                r_pct  = pct(r["profit"], r["deposited"])
+                d_pct  = pct(d["balance"] - d["start"], d["start"])
+                send(uid,
+                     "📅 <b>Еженедельный отчёт CryptoBot Pro</b>\n"
+                     + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                     + "🎮 Демо:     " + sign(d_pct) + fmt(d_pct, ".1f") + "%  ($" + fmt(d["balance"]) + ")\n"
+                     + "💼 Реальный: " + sign(r_pct) + fmt(r_pct, ".1f") + "%  ($" + fmt(r["balance"]) + ")\n\n"
+                     + "🤖 <b>Бот за неделю:</b>\n"
+                     + "Winrate: " + str(wr_pct) + "%\n"
+                     + "P&L за нед.: <code>" + sign(week_pnl) + fmt(week_pnl) + " USD</code>\n\n"
+                     + "Продолжаем торговать! 🚀",
+                     [[{"text": "📊 Подробнее", "callback_data": "stats"}]])
+                time.sleep(0.05)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("weekly_report: %s", e)
+
+
+# ── Рыночные данные ───────────────────────────────────────────────────────────
+
+def fetch_candles(sym, interval="30m", period="60d"):
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/" + sym
-        r   = requests.get(url, params={"interval": "30m", "range": "60d"},
+        r   = requests.get(url,
+                           params={"interval": interval, "range": period},
                            headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         r.raise_for_status()
         res = r.json()["chart"]["result"][0]
@@ -690,8 +990,9 @@ def fetch_candles(sym):
             "vol": q.get("volume", []),
         })
         df = df.dropna(subset=["cl", "hi", "lo"]).reset_index(drop=True)
-        for c in ["cl", "hi", "lo", "vol"]:
+        for c in ["cl", "hi", "lo"]:
             df[c] = df[c].astype(float)
+        df["vol"] = pd.to_numeric(df["vol"], errors="coerce").fillna(0)
         if len(df) < EMA_SLOW + 10:
             return None
         return df.tail(CANDLES).reset_index(drop=True)
@@ -703,7 +1004,8 @@ def fetch_candles(sym):
 def fetch_price(sym):
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/" + sym
-        r   = requests.get(url, params={"interval": "1m", "range": "1d"},
+        r   = requests.get(url,
+                           params={"interval": "1m", "range": "1d"},
                            headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         r.raise_for_status()
         closes = r.json()["chart"]["result"][0]["indicators"]["quote"][0]["close"]
@@ -714,48 +1016,115 @@ def fetch_price(sym):
         return None
 
 
+# ── Индикаторы ────────────────────────────────────────────────────────────────
+
 def calc_ind(df):
-    df       = df.copy()
-    df["ef"] = df["cl"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["es"] = df["cl"].ewm(span=EMA_SLOW, adjust=False).mean()
+    df = df.copy()
+
+    # EMA
+    df["ef"]  = df["cl"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["em"]  = df["cl"].ewm(span=EMA_MID,  adjust=False).mean()
+    df["es"]  = df["cl"].ewm(span=EMA_SLOW, adjust=False).mean()
+
+    # Williams %R
     hh       = df["hi"].rolling(WR_PERIOD).max()
     ll       = df["lo"].rolling(WR_PERIOD).min()
     df["wr"] = ((hh - df["cl"]) / (hh - ll).replace(0, 1)) * -100
+
+    # MACD
     mf       = df["cl"].ewm(span=MACD_FAST, adjust=False).mean()
     ms       = df["cl"].ewm(span=MACD_SLOW, adjust=False).mean()
     mc       = (mf - ms).ewm(span=MACD_SIG, adjust=False).mean()
     df["mh"] = (mf - ms) - mc
+
+    # ATR
     hl       = df["hi"] - df["lo"]
     hc       = (df["hi"] - df["cl"].shift()).abs()
     lc       = (df["lo"] - df["cl"].shift()).abs()
     tr       = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["atr"] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+
+    # RSI
     delta    = df["cl"].diff()
     gain     = delta.clip(lower=0).ewm(span=RSI_PERIOD, adjust=False).mean()
     loss_    = (-delta.clip(upper=0)).ewm(span=RSI_PERIOD, adjust=False).mean()
     rs       = gain / loss_.replace(0, float("inf"))
     df["rsi"] = 100 - (100 / (1 + rs))
+
+    # ADX (сила тренда — ключевой фильтр!)
+    df["pdm"] = (df["hi"] - df["hi"].shift()).clip(lower=0)
+    df["ndm"] = (df["lo"].shift() - df["lo"]).clip(lower=0)
+    # Где pdm > ndm, обнуляем ndm и наоборот
+    pdm_clean = df["pdm"].where(df["pdm"] > df["ndm"], 0)
+    ndm_clean = df["ndm"].where(df["ndm"] > df["pdm"], 0)
+    atr_adx   = tr.ewm(span=ADX_PERIOD, adjust=False).mean()
+    di_p      = 100 * pdm_clean.ewm(span=ADX_PERIOD, adjust=False).mean() / atr_adx.replace(0, 1)
+    di_n      = 100 * ndm_clean.ewm(span=ADX_PERIOD, adjust=False).mean() / atr_adx.replace(0, 1)
+    dx        = (100 * (di_p - di_n).abs() / (di_p + di_n).replace(0, 1))
+    df["adx"] = dx.ewm(span=ADX_PERIOD, adjust=False).mean()
+    df["dip"] = di_p
+    df["din"] = di_n
+
+    # Объём скользящее среднее
+    df["vol_ma"] = df["vol"].rolling(VOL_MA).mean()
+
     return df
 
 
 def get_signal(df):
-    c   = df.iloc[-1]
-    p   = df.iloc[-2]
-    up  = c["ef"] > c["es"]
+    """
+    Профессиональная стратегия с 5 подтверждениями.
+    BUY только при совпадении ВСЕХ условий (высокая точность).
+    SELL при любом из условий выхода.
+    """
+    if len(df) < 3:
+        return None
+
+    c  = df.iloc[-1]
+    p  = df.iloc[-2]
+    p2 = df.iloc[-3]
+
+    # ── ТРЕНД: иерархия EMA ──
+    bull_trend = (c["ef"] > c["em"]) and (c["em"] > c["es"])
+    bear_trend = (c["ef"] < c["em"]) and (c["em"] < c["es"])
+
+    # ── СИЛА ТРЕНДА: ADX ──
+    strong_trend = c["adx"] > ADX_MIN
+
+    # ── СИГНАЛ ВХОДА ──
+    # Williams %R: пересечение снизу вверх из зоны перепроданности
+    wr_cross_up  = (p["wr"] <= WR_OVERSOLD) and (c["wr"] > WR_OVERSOLD)
+    # Или текущая ситуация — wr ещё в перепроданности но начинает расти
+    wr_rising    = (c["wr"] > p["wr"]) and (c["wr"] <= -60)
+
+    # MACD гистограмма: разворот с отрицательного на положительное
+    macd_cross   = (p["mh"] < 0) and (c["mh"] >= 0)
+    # Или уже растёт второй бар подряд
+    macd_growing = (c["mh"] > p["mh"]) and (p["mh"] > p2["mh"]) and (c["mh"] < 0)
+
+    # RSI: зона импульса (45-65 при входе — не перекуплен, но есть сила)
+    rsi_ok = 42 <= c["rsi"] <= 65
+
+    # Объём: выше среднего (реальный интерес)
+    vol_ok = (c["vol_ma"] > 0) and (c["vol"] >= c["vol_ma"] * VOL_MULT)
+
     buy = (
-        up
-        and p["wr"] <= WR_OVERSOLD
-        and c["wr"] > WR_OVERSOLD
-        and p["mh"] < 0
-        and c["mh"] >= 0
-        and 40 <= c["rsi"] <= 65
+        bull_trend
+        and strong_trend
+        and (wr_cross_up or wr_rising)
+        and (macd_cross or macd_growing)
+        and rsi_ok
+        and vol_ok
     )
+
+    # ── СИГНАЛ ВЫХОДА ──
     sell = (
-        c["wr"] >= WR_OVERBOUGHT
-        or (p["mh"] >= 0 and c["mh"] < 0)
-        or not up
-        or c["rsi"] >= 75
+        bear_trend                            # тренд сломан
+        or c["rsi"] >= 75                     # перекупленность
+        or (c["mh"] < 0 and p["mh"] >= 0)    # MACD разворот вниз
+        or c["wr"] >= WR_OB                   # Williams %R перекуплен
     )
+
     if buy:
         return "BUY"
     if sell:
@@ -766,53 +1135,171 @@ def get_signal(df):
 # ── Исполнение сделок ─────────────────────────────────────────────────────────
 
 def do_buy(pair, price, atr):
-    s   = BOT_STATES[pair["symbol"]]
-    if s["pos"]:
+    s = BOT_STATES[pair["symbol"]]
+    if s.get("pos"):
         return None
+    if active_positions() >= MAX_POS:
+        return None
+    if s.get("halted") and time.time() < s.get("halt_until", 0):
+        return None
+
     amt  = s["usdt"] * (RISK_PCT / 100)
-    qty  = round(amt / price, 6)
+    qty  = round(amt / price, 8)
     cost = qty * price
     if cost > s["usdt"]:
         return None
-    sl        = round(price - ATR_MULT * atr, 6)
+
+    sl = round(price - ATR_SL_MULT * atr, 6)
+    tp = round(price + ATR_TP_MULT * atr, 6)
+
     s["usdt"] -= cost
-    s["coin"] += qty
+    s["coin"]  = qty
     s["n"]    += 1
-    s["pos"]   = {"entry": price, "qty": qty, "sl": sl, "atr": atr, "time": now_str()}
+    s["pos"]   = {
+        "entry":     price,
+        "qty":       qty,
+        "sl":        sl,
+        "tp":        tp,
+        "trail_sl":  sl,     # trailing stop — поднимается с ценой
+        "atr":       atr,
+        "time":      ts(),
+    }
     save_bot_state(pair["symbol"], s)
     t = {
         "side": "BUY", "pair": pair["name"], "qty": qty,
-        "price": price, "sl": sl, "atr": atr, "time": s["pos"]["time"],
+        "price": price, "sl": sl, "tp": tp, "atr": atr, "time": s["pos"]["time"],
         "id": "P-" + pair["name"] + "-" + str(s["n"]).zfill(4),
     }
     log_trade(t)
     return t
 
 
+def update_trailing_stop(pair, price):
+    """Поднимаем trailing-stop вслед за ценой."""
+    s   = BOT_STATES[pair["symbol"]]
+    pos = s.get("pos")
+    if not pos:
+        return
+    new_sl = round(price - ATR_TRAIL * pos["atr"], 6)
+    if new_sl > pos.get("trail_sl", pos["sl"]):
+        pos["trail_sl"] = new_sl
+        # Также поднимаем основной SL
+        pos["sl"]       = new_sl
+        s["pos"]        = pos
+        save_bot_state(pair["symbol"], s)
+
+
+def check_exits(pair, price):
+    """Проверяем Stop-Loss и Take-Profit."""
+    s   = BOT_STATES[pair["symbol"]]
+    pos = s.get("pos")
+    if not pos:
+        return False
+
+    # Обновляем trailing stop
+    update_trailing_stop(pair, price)
+
+    # Проверяем SL
+    if price <= pos["sl"]:
+        t = do_sell(pair, price, "STOP-LOSS")
+        if t:
+            pnl = t.get("pnl", 0)
+            send(ADMIN_ID,
+                 "⛔ <b>СТОП-ЛОСС — " + pair["name"] + "</b>\n"
+                 + "Цена: $" + fmt(price) + "\n"
+                 + "P&L: <code>" + sign(pnl) + fmt(pnl) + " USD</code>")
+        return True
+
+    # Проверяем TP
+    if price >= pos["tp"]:
+        t = do_sell(pair, price, "TAKE-PROFIT")
+        if t:
+            pnl = t.get("pnl", 0)
+            send(ADMIN_ID,
+                 "🎯 <b>ТЕЙК-ПРОФИТ — " + pair["name"] + "</b>\n"
+                 + "Цена: $" + fmt(price) + "\n"
+                 + "P&L: <code>" + sign(pnl) + fmt(pnl) + " USD</code>")
+        return True
+
+    return False
+
+
+def circuit_breaker_check(pair, sym):
+    """Дневной circuit-breaker и глобальная защита от просадки."""
+    s       = BOT_STATES[sym]
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Сброс дневного счётчика
+    if s.get("day_date") != today:
+        s["day_date"]  = today
+        s["day_start"] = s["usdt"]
+        s["halted"]    = False
+
+    equity = s["usdt"]
+
+    # Дневной убыток > DAY_LOSS_PCT%
+    if s["day_start"] > 0:
+        day_dd = pct(s["day_start"] - equity, s["day_start"])
+        if day_dd > DAY_LOSS_PCT and not s.get("halted"):
+            s["halted"]     = True
+            s["halt_until"] = time.time() + 86400  # 24 часа
+            save_bot_state(sym, s)
+            send(ADMIN_ID,
+                 "⛔ <b>CIRCUIT BREAKER — " + pair["name"] + "</b>\n"
+                 + "Дневной убыток: " + fmt(day_dd, ".1f") + "%\n"
+                 + "Торговля приостановлена на 24 часа")
+            return True
+
+    # Глобальная просадка > GLOBAL_DD% от пика
+    if equity > s.get("peak", equity):
+        s["peak"] = equity
+    if s["peak"] > 0:
+        global_dd = pct(s["peak"] - equity, s["peak"])
+        if global_dd > GLOBAL_DD and not s.get("halted"):
+            s["halted"]     = True
+            s["halt_until"] = time.time() + 86400 * 3  # 3 дня
+            save_bot_state(sym, s)
+            send(ADMIN_ID,
+                 "🚨 <b>ГЛОБАЛЬНАЯ ЗАЩИТА — " + pair["name"] + "</b>\n"
+                 + "Просадка от пика: " + fmt(global_dd, ".1f") + "%\n"
+                 + "Торговля приостановлена на 3 дня!")
+            return True
+
+    # Снятие хальта если время вышло
+    if s.get("halted") and time.time() >= s.get("halt_until", 0):
+        s["halted"]    = False
+        s["halt_until"] = 0
+        s["day_start"]  = s["usdt"]
+        save_bot_state(sym, s)
+        send(ADMIN_ID, "✅ Торговля возобновлена: " + pair["name"])
+
+    return s.get("halted", False)
+
+
 def do_sell(pair, price, reason="SIGNAL"):
     s   = BOT_STATES[pair["symbol"]]
-    qty = s["coin"]
+    qty = s.get("coin", 0)
     if qty <= 0.000001:
         return None
+
     s["usdt"] += qty * price
     s["coin"]  = 0.0
-    pnl = pnl_pct = 0.0
-    if s["pos"]:
+    pnl = 0.0
+    if s.get("pos"):
         entry    = s["pos"]["entry"]
         pnl      = (price - entry) * qty
-        pnl_pct  = (price - entry) / entry * 100
         s["pnl"] += pnl
         if pnl >= 0:
             s["wins"] += 1
         else:
             s["loss"] += 1
         s["pos"] = None
+
     s["n"] += 1
-    ts = now_str()
-    t  = {
-        "side": "SELL", "pair": pair["name"], "qty": round(qty, 6),
-        "price": price, "pnl": pnl, "pnl_pct": pnl_pct,
-        "reason": reason, "time": ts,
+    t = {
+        "side": "SELL", "pair": pair["name"], "qty": round(qty, 8),
+        "price": price, "pnl": pnl,
+        "reason": reason, "time": ts(),
         "id": "P-" + pair["name"] + "-" + str(s["n"]).zfill(4),
     }
     save_bot_state(pair["symbol"], s)
@@ -821,28 +1308,15 @@ def do_sell(pair, price, reason="SIGNAL"):
     return t
 
 
-def check_sl(pair, price):
-    s = BOT_STATES[pair["symbol"]]
-    if s["pos"] and price <= s["pos"]["sl"]:
-        t = do_sell(pair, price, reason="STOP-LOSS")
-        if t:
-            send(ADMIN_ID,
-                 "⛔ <b>СТОП-ЛОСС — " + pair["name"] + "</b>\n"
-                 + "Цена: $" + fmt(price) + "\n"
-                 + "P&L: <code>" + sign(t.get("pnl", 0)) + fmt(t.get("pnl", 0)) + " USD</code>")
-        return True
-    return False
-
-
-# ── Обработка обновлений ──────────────────────────────────────────────────────
+# ── Обработка сообщений ───────────────────────────────────────────────────────
 
 def get_updates():
-    global LAST_UPDATE_ID
+    global LAST_UPD_ID
     try:
-        r       = api("getUpdates", {"offset": LAST_UPDATE_ID + 1, "timeout": 2, "limit": 100})
+        r       = api("getUpdates", {"offset": LAST_UPD_ID + 1, "timeout": 2, "limit": 100})
         updates = r.get("result", [])
         for upd in updates:
-            LAST_UPDATE_ID = upd["update_id"]
+            LAST_UPD_ID = upd["update_id"]
             try:
                 msg = upd.get("message", {})
                 cb  = upd.get("callback_query", {})
@@ -851,7 +1325,7 @@ def get_updates():
                 if cb:
                     on_callback(cb)
             except Exception as e:
-                logger.error("Обработка update: %s", e)
+                logger.error("update error: %s", e)
     except Exception as e:
         logger.error("get_updates: %s", e)
 
@@ -864,19 +1338,32 @@ def on_message(msg):
         return
 
     state = STATES.get(cid, {})
-    logger.info("Сообщение от %s: %s", cid, text[:60])
+    logger.info("MSG %s: %s", cid, text[:60])
 
+    # /start [ref_CODE]
     if text.startswith("/start"):
         user         = get_user(cid)
         user["name"] = name
+        # Обработка реферального кода
+        parts = text.split()
+        if len(parts) > 1 and parts[1].startswith("ref_") and user.get("ref_by") is None:
+            ref_code = parts[1][4:]
+            users    = load_users()
+            for uid, u in users.items():
+                if u.get("ref_code") == ref_code and uid != cid:
+                    user["ref_by"] = uid
+                    users[uid]["ref_count"] = users[uid].get("ref_count", 0) + 1
+                    save_users(users)
+                    send(uid, "🎉 По вашей реферальной ссылке зарегистрировался новый пользователь!")
+                    break
         save_user(cid, user)
         send(cid,
              "👋 <b>Добро пожаловать в CryptoBot Pro!</b>\n\n"
-             + "Я торгую BTC, ETH, SOL автоматически 24/7\n"
-             + "по профессиональной стратегии.\n\n"
-             + "🎮 <b>Демо-счёт:</b> $1 000 виртуально — сразу!\n"
-             + "💼 <b>Реальный:</b> от $50 USDT TRC20\n\n"
-             + "Нажмите кнопку ниже 👇")
+             + "Я торгую BTC, ETH и SOL автоматически 24/7\n"
+             + "с профессиональной мультиусловной стратегией.\n\n"
+             + "🎮 <b>Демо-счёт $1 000</b> уже доступен!\n"
+             + "💼 Для реального — минимальный депозит $50 USDT\n\n"
+             + "⬇️ Выберите раздел ниже 👇")
         screen_main(cid)
         return
 
@@ -894,18 +1381,18 @@ def on_message(msg):
         save_user(cid, user)
         STATES.pop(cid, None)
         send(cid,
-             "⏳ <b>Заявка на пополнение принята!</b>\n\n"
+             "⏳ <b>Заявка принята!</b>\n\n"
              + "Сумма: <b>$" + str(int(amt)) + " USDT</b>\n"
-             + "TXID: <code>" + text[:30] + "</code>\n\n"
+             + "TXID: <code>" + text[:32] + "</code>\n\n"
              + "Статус: ожидает подтверждения (до 30 мин)\n"
-             + "Уведомим вас после зачисления ✅",
+             + "Уведомим вас сразу после зачисления ✅",
              kb_back())
         for adm in ADMIN_IDS.split(","):
             adm = adm.strip()
             if adm:
                 send(adm,
                      "🆕 <b>Новый депозит!</b>\n\n"
-                     + "Пользователь: <b>" + user["name"] + "</b>  (<code>" + cid + "</code>)\n"
+                     + "Пользователь: <b>" + user["name"] + "</b>  <code>" + cid + "</code>\n"
                      + "Сумма: <b>$" + str(int(amt)) + "</b>\n"
                      + "TXID: <code>" + text + "</code>",
                      [[{"text": "✅ Подтвердить $" + str(int(amt)),
@@ -921,24 +1408,24 @@ def on_message(msg):
         try:
             amt = float(parts[1])
         except Exception:
-            send(cid, "⚠️ Неверная сумма. Введите число.")
+            send(cid, "⚠️ Неверная сумма.")
             return
         user = get_user(cid)
         if amt < 10:
-            send(cid, "⚠️ Минимальная сумма вывода $10")
+            send(cid, "⚠️ Минимальный вывод: $10")
             return
         if amt > user["real"]["balance"]:
             send(cid, "⚠️ Недостаточно средств. Доступно: $" + fmt(user["real"]["balance"]))
             return
         user["real"]["withdrawals"].append(
-            {"wallet": wallet_addr, "amount": amt, "time": now_str(), "status": "pending"}
+            {"wallet": wallet_addr, "amount": amt, "time": ts(), "status": "pending"}
         )
         save_user(cid, user)
         STATES.pop(cid, None)
         send(cid,
              "⏳ <b>Заявка на вывод принята!</b>\n\n"
              + "Сумма: <b>$" + fmt(amt) + " USDT</b>\n"
-             + "Кошелёк: <code>" + wallet_addr[:15] + "...</code>\n\n"
+             + "Кошелёк: <code>" + wallet_addr[:20] + "...</code>\n\n"
              + "Обработка: до 24 часов ✅",
              kb_back())
         for adm in ADMIN_IDS.split(","):
@@ -946,7 +1433,7 @@ def on_message(msg):
             if adm:
                 send(adm,
                      "💸 <b>Запрос на вывод!</b>\n\n"
-                     + "Пользователь: <b>" + user["name"] + "</b>  (<code>" + cid + "</code>)\n"
+                     + "Пользователь: <b>" + user["name"] + "</b>  <code>" + cid + "</code>\n"
                      + "Сумма: <b>$" + fmt(amt) + "</b>\n"
                      + "Кошелёк: <code>" + wallet_addr + "</code>",
                      [[{"text": "✅ Выплатить $" + str(int(amt)),
@@ -957,27 +1444,26 @@ def on_message(msg):
         try:
             amt = float(text.replace(",", "."))
             if amt < 50:
-                send(cid, "⚠️ Минимальная сумма $50")
+                send(cid, "⚠️ Минимум $50")
                 return
             STATES.pop(cid, None)
             screen_deposit_details(cid, amt)
         except Exception:
-            send(cid, "⚠️ Введите число. Например: 150")
+            send(cid, "⚠️ Введите число. Например: 200")
         return
 
     if st == "broadcast_waiting" and is_admin(cid):
-        users  = load_users()
-        count  = 0
-        errors = 0
+        users = load_users()
+        ok    = 0
         for uid in users:
             try:
                 send(uid, "📢 <b>Сообщение от администратора:</b>\n\n" + text)
-                count += 1
+                ok += 1
                 time.sleep(0.05)
             except Exception:
-                errors += 1
+                pass
         STATES.pop(cid, None)
-        send(cid, "✅ Рассылка завершена!\nОтправлено: " + str(count) + "\nОшибок: " + str(errors))
+        send(cid, "✅ Рассылка завершена! Отправлено: " + str(ok))
         return
 
     screen_main(cid)
@@ -989,79 +1475,64 @@ def on_callback(cb):
     if not cid:
         return
     answer_cb(cb["id"])
-    logger.info("Callback от %s: %s", cid, data)
+    logger.info("CB %s: %s", cid, data)
 
     try:
-        if data == "menu":
-            screen_main(cid)
-
-        elif data == "account":
-            screen_account(cid)
-
-        elif data == "demo":
-            screen_demo(cid)
-
-        elif data == "real":
-            screen_real(cid)
-
-        elif data == "deposit":
-            screen_deposit(cid)
-
-        elif data == "withdraw":
-            screen_withdraw(cid)
-
-        elif data == "stats":
-            screen_stats(cid)
-
-        elif data == "history":
-            screen_history(cid)
-
-        elif data == "help":
-            screen_help(cid)
+        if   data == "menu":           screen_main(cid)
+        elif data == "account":        screen_account(cid)
+        elif data == "my_stats":       screen_my_stats(cid)
+        elif data == "leaderboard":    screen_leaderboard(cid)
+        elif data == "demo":           screen_demo(cid)
+        elif data == "real":           screen_real(cid)
+        elif data == "deposit":        screen_deposit(cid)
+        elif data == "withdraw":       screen_withdraw(cid)
+        elif data == "stats":          screen_stats(cid)
+        elif data == "history":        screen_history(cid)
+        elif data == "help":           screen_help(cid)
+        elif data == "market":         screen_market(cid)
+        elif data == "referral":       screen_referral(cid)
 
         elif data == "toggle_notify":
             user = get_user(cid)
             user["notify"] = not user.get("notify", True)
             save_user(cid, user)
-            status = "включены 🔔" if user["notify"] else "выключены 🔕"
-            send(cid, "Уведомления " + status, kb_back())
+            txt = "Уведомления включены 🔔" if user["notify"] else "Уведомления выключены 🔕"
+            send(cid, txt, kb_back())
 
-        elif data == "admin" and is_admin(cid):
-            screen_admin(cid)
+        elif data == "toggle_compound":
+            user = get_user(cid)
+            user["real"]["autocompound"] = not user["real"].get("autocompound", True)
+            save_user(cid, user)
+            txt = "✅ Автореинвест включён" if user["real"]["autocompound"] else "❌ Автореинвест выключен"
+            send(cid, txt + "\n\nВозврат в меню:", kb_back())
 
-        elif data == "adm_users" and is_admin(cid):
-            screen_admin_users(cid)
-
-        elif data == "adm_deposits" and is_admin(cid):
-            screen_admin_deposits(cid)
-
-        elif data == "adm_withdrawals" and is_admin(cid):
-            screen_admin_withdrawals(cid)
-
-        elif data == "adm_stats" and is_admin(cid):
-            screen_stats(cid)
+        elif data == "admin" and is_admin(cid):         screen_admin(cid)
+        elif data == "adm_users" and is_admin(cid):     screen_admin_users(cid)
+        elif data == "adm_deposits" and is_admin(cid):  screen_admin_deposits(cid)
+        elif data == "adm_withdrawals" and is_admin(cid): screen_admin_withdrawals(cid)
+        elif data == "adm_stats" and is_admin(cid):     screen_stats(cid)
+        elif data == "adm_trades" and is_admin(cid):    screen_admin_trades(cid)
 
         elif data == "adm_broadcast" and is_admin(cid):
             STATES[cid] = {"state": "broadcast_waiting"}
-            send(cid, "📢 Введите текст рассылки:")
+            send(cid, "📢 Введите текст рассылки всем пользователям:")
 
-        # ── ВАЖНО: depsent_ проверяется ДО dep_ ──
+        # ── ВАЖНО: depsent_ ВСЕГДА перед dep_ ──
         elif data.startswith("depsent_"):
             raw = data[len("depsent_"):]
             try:
                 amt = float(raw)
             except ValueError:
-                logger.error("depsent_ parse error: %s", raw)
                 send(cid, "⚠️ Ошибка. Попробуйте снова.")
                 return
             STATES[cid] = {"state": "txid_waiting", "amount": amt}
-            send(cid, "📋 Введите TX-хэш вашей транзакции:")
+            send(cid, "📋 Введите TX-хэш вашей транзакции (TXID):")
 
         elif data.startswith("dep_"):
             amt_str = data[len("dep_"):]
             if amt_str == "custom":
                 STATES[cid] = {"state": "custom_dep"}
-                send(cid, "✏️ Введите сумму пополнения в USDT (минимум $50):")
+                send(cid, "✏️ Введите сумму в USDT (минимум $50):")
             else:
                 try:
                     screen_deposit_details(cid, float(amt_str))
@@ -1076,7 +1547,6 @@ def on_callback(cb):
                 try:
                     amt = float(parts[1])
                 except ValueError:
-                    send(cid, "⚠️ Ошибка парсинга суммы.")
                     return
                 user = get_user(target)
                 user["real"]["balance"]     += amt
@@ -1084,13 +1554,15 @@ def on_callback(cb):
                 user["real"]["active"]       = True
                 user["real"]["pending"]      = 0.0
                 user["real"]["pending_txid"] = ""
+                if user["real"]["balance"] > user["real"].get("peak", 0):
+                    user["real"]["peak"] = user["real"]["balance"]
                 save_user(target, user)
                 send(target,
                      "🎉 <b>Депозит подтверждён!</b>\n\n"
                      + "Зачислено: <b>$" + fmt(amt) + " USDT</b>\n"
                      + "Баланс: <b>$" + fmt(user["real"]["balance"]) + "</b>\n\n"
                      + "✅ Бот начинает торговать вашими средствами!\n"
-                     + "Вы будете получать уведомления о каждой сделке.",
+                     + "Уведомления о каждой сделке придут автоматически.",
                      [[{"text": "💼 Мой реальный счёт", "callback_data": "real"}]])
                 send(cid, "✅ Депозит $" + str(int(amt)) + " подтверждён для " + target)
 
@@ -1102,7 +1574,6 @@ def on_callback(cb):
                 try:
                     amt = float(parts[1])
                 except ValueError:
-                    send(cid, "⚠️ Ошибка парсинга суммы.")
                     return
                 user = get_user(target)
                 if user["real"]["balance"] >= amt:
@@ -1122,38 +1593,40 @@ def on_callback(cb):
                     send(cid, "⚠️ Недостаточно средств у пользователя " + target)
 
         else:
-            logger.warning("Неизвестный callback: %s от %s", data, cid)
+            logger.warning("Неизвестный callback: %s", data)
 
     except Exception as e:
-        logger.error("on_callback %s / %s: %s", cid, data, e)
+        logger.error("on_callback %s/%s: %s", cid, data, e)
         send(cid, "⚠️ Произошла ошибка. Попробуйте снова.")
 
 
-# ── Главный цикл ──────────────────────────────────────────────────────────────
+# ── Главный торговый цикл ─────────────────────────────────────────────────────
 
 def run():
     global BOT_STATES
     BOT_STATES = {p["symbol"]: load_bot_state(p["symbol"]) for p in PAIRS}
-    logger.info("CryptoBot Pro запущен ✅")
+    logger.info("CryptoBot Pro v3 запущен ✅")
 
     send(ADMIN_ID,
-         "🤖 <b>CryptoBot Pro — ЗАПУЩЕН</b>\n"
-         + "━━━━━━━━━━━━━━━━━━━━━\n\n"
-         + "Режим: БУМАЖНАЯ ТОРГОВЛЯ\n"
-         + "Пары: BTC | ETH | SOL\n"
-         + "Стратегия: EMA50/200 + WR + MACD + ATR + RSI\n"
-         + "Таймфрейм: 30 мин  |  Риск: 2%\n\n"
-         + "Функции:\n"
-         + "• Демо-счёт $1 000 на каждого пользователя\n"
-         + "• Реальные счета с пополнением\n"
-         + "• Автораспределение прибыли\n"
-         + "• Депозиты/выводы\n"
-         + "• Панель администратора\n"
-         + "• Рассылка пользователям\n\n"
-         + "/admin — открыть панель")
+         "🤖 <b>CryptoBot Pro v3 — ЗАПУЩЕН</b>\n"
+         + "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+         + "Стратегия: EMA(20/50/200) + ADX + WR + MACD + RSI + Объём\n"
+         + "Защита: Trailing-stop | TP(3×ATR) | Circuit-Breaker | MaxDD\n"
+         + "Цель: 80-120% годовых при контролируемом риске\n\n"
+         + "Новое:\n"
+         + "• ADX фильтр (только сильные тренды)\n"
+         + "• Trailing-stop (тянется за ценой)\n"
+         + "• Take-profit 3×ATR (соотношение R:R 1:2)\n"
+         + "• Circuit-breaker (стоп при дневном убытке >8%)\n"
+         + "• Реферальная программа (5% с прибыли)\n"
+         + "• Лидерборд инвесторов\n"
+         + "• Автореинвест прибыли\n"
+         + "• Еженедельные отчёты\n\n"
+         + "/admin — панель управления")
 
-    last_trade_check = 0
-    check_num        = 0
+    last_trade = 0
+    last_report = time.time()
+    check_num   = 0
 
     while True:
         try:
@@ -1163,55 +1636,84 @@ def run():
             time.sleep(5)
 
         now = time.time()
-        if now - last_trade_check >= TRADE_INTERVAL:
-            last_trade_check = now
-            check_num       += 1
-            logger.info("Торговая проверка #%d", check_num)
+
+        # ── Торговля каждые 30 минут ──
+        if now - last_trade >= TRADE_INT:
+            last_trade = now
+            check_num += 1
+            logger.info("─── Торговая проверка #%d ───", check_num)
+
             for pair in PAIRS:
                 try:
+                    # Circuit-breaker проверка
+                    if circuit_breaker_check(pair, pair["symbol"]):
+                        continue
+
                     df = fetch_candles(pair["yahoo"])
                     if df is None:
+                        logger.warning("%s: нет данных", pair["name"])
                         continue
                     df    = calc_ind(df)
                     price = fetch_price(pair["yahoo"])
                     if price is None:
                         continue
-                    c  = df.iloc[-1]
-                    up = c["ef"] > c["es"]
-                    logger.info("%s $%.2f  WR=%.1f  RSI=%.1f  Тренд=%s",
-                                pair["name"], price, c["wr"], c["rsi"],
-                                "ВВЕРХ" if up else "ВНИЗ")
+
+                    c   = df.iloc[-1]
+                    adx = c["adx"]
+
+                    logger.info(
+                        "%s $%.2f | EMA↑=%s ADX=%.1f WR=%.1f RSI=%.1f MACD=%+.4f",
+                        pair["name"], price,
+                        str(c["ef"] > c["em"] > c["es"]),
+                        adx, c["wr"], c["rsi"], c["mh"],
+                    )
+
                     s = BOT_STATES[pair["symbol"]]
-                    if s["pos"] and check_sl(pair, price):
+
+                    # Проверка выходов (SL/TP/Trailing)
+                    if s.get("pos") and check_exits(pair, price):
                         continue
+
+                    # Торговый сигнал
                     sig = get_signal(df)
                     if sig == "BUY":
                         t = do_buy(pair, price, c["atr"])
                         if t:
-                            logger.info("%s ПОКУПКА @ $%.2f", pair["name"], price)
+                            logger.info("%s ПОКУПКА @ $%.2f  SL=$%.2f TP=$%.2f",
+                                        pair["name"], price, t["sl"], t["tp"])
                             send(ADMIN_ID,
                                  "📈 <b>ПОКУПКА — " + pair["name"] + "</b>\n"
-                                 + "Цена: $" + fmt(price) + "\n"
-                                 + "Стоп: $" + fmt(t["sl"]) + "\n"
-                                 + "Риск: 2%")
-                    elif sig == "SELL" and s["pos"]:
-                        t = do_sell(pair, price, reason="SIGNAL")
+                                 + "Цена:  $" + fmt(price) + "\n"
+                                 + "Стоп:  $" + fmt(t["sl"]) + "\n"
+                                 + "TP:    $" + fmt(t["tp"]) + "\n"
+                                 + "ADX:   " + fmt(adx, ".1f") + "\n"
+                                 + "Риск:  2% | R:R 1:2")
+                    elif sig == "SELL" and s.get("pos"):
+                        t = do_sell(pair, price, "SIGNAL")
                         if t:
                             pnl  = t.get("pnl", 0)
                             icon = "✅" if pnl >= 0 else "❌"
-                            logger.info("%s ПРОДАЖА @ $%.2f  PnL=%.2f", pair["name"], price, pnl)
+                            logger.info("%s ПРОДАЖА @ $%.2f  PnL=$%.2f", pair["name"], price, pnl)
                             send(ADMIN_ID,
                                  icon + " <b>ПРОДАЖА — " + pair["name"] + "</b>\n"
                                  + "Цена: $" + fmt(price) + "\n"
-                                 + "P&L: <code>" + sign(pnl) + fmt(pnl) + " USD</code>")
+                                 + "P&L:  <code>" + sign(pnl) + fmt(pnl) + " USD</code>")
+
                 except Exception as e:
                     logger.error("Торговля %s: %s", pair["name"], e)
                 time.sleep(2)
 
+            # Статистика каждые 24 часа (48 проверок × 30 мин)
             if check_num % 48 == 0:
                 screen_stats(ADMIN_ID)
 
-        time.sleep(CMD_INTERVAL)
+        # ── Еженедельный отчёт всем пользователям ──
+        if now - last_report >= 86400 * REPORT_INT:
+            last_report = now
+            logger.info("Отправляем еженедельный отчёт...")
+            weekly_report()
+
+        time.sleep(CMD_INT)
 
 
 if __name__ == "__main__":
