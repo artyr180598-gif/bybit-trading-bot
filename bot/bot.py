@@ -71,8 +71,11 @@ LIVE_MODE  = _keys_ok and not _demo_env
 
 DATA_DIR   = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-USERS_FILE  = DATA_DIR / "users.json"
-TRADES_FILE = DATA_DIR / "bot_trades.jsonl"
+USERS_FILE    = DATA_DIR / "users.json"
+TRADES_FILE   = DATA_DIR / "bot_trades.jsonl"
+DEPOSITS_FILE = DATA_DIR / "pending_deposits.json"
+
+BOT_USERNAME = ""   # заполняется при старте через getMe
 
 # ─── ТОРГОВЫЕ ПАРЫ ────────────────────────────────────────────────────────────
 PAIRS = [
@@ -1162,6 +1165,33 @@ def save_user(cid, u):
 def is_admin(cid):
     return str(cid) in [x.strip() for x in ADMIN_IDS.split(",") if x.strip()]
 
+
+# ─── ЗАЯВКИ НА ПОПОЛНЕНИЕ ─────────────────────────────────────────────────────
+
+def load_pending_deposits():
+    try:
+        if DEPOSITS_FILE.exists():
+            return json.loads(DEPOSITS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+def save_pending_deposits(deps):
+    try:
+        DEPOSITS_FILE.write_text(json.dumps(deps, ensure_ascii=False, indent=2))
+    except Exception as e:
+        logger.error("save_pending_deposits: %s", e)
+
+def add_pending_deposit(uid, amount, username=""):
+    deps = load_pending_deposits()
+    deps[str(uid)] = {"amount": amount, "username": username, "time": ts()}
+    save_pending_deposits(deps)
+
+def remove_pending_deposit(uid):
+    deps = load_pending_deposits()
+    deps.pop(str(uid), None)
+    save_pending_deposits(deps)
+
 # ─── УВЕДОМЛЕНИЯ ВСЕМ ПОЛЬЗОВАТЕЛЯМ ──────────────────────────────────────────
 
 def notify_all_users(text):
@@ -1456,6 +1486,14 @@ def kb_confirm_dep(amount):
     return [
         [{"text": "✅ Я отправил платёж", "callback_data": f"depsent_{amount}"}],
         [{"text": "❌ Отмена",           "callback_data": "menu"}],
+    ]
+
+def kb_admin_dep(uid, amount):
+    """Кнопки подтверждения/отклонения депозита для администратора"""
+    a = int(amount * 100)   # храним в центах чтобы избежать проблем с точкой
+    return [
+        [{"text": "✅ Подтвердить платёж", "callback_data": f"dep_ok_{uid}_{a}"},
+         {"text": "❌ Отклонить",          "callback_data": f"dep_no_{uid}_{a}"}],
     ]
 
 def kb_admin():
@@ -1914,15 +1952,30 @@ def screen_deposit(cid):
 def screen_referral(cid):
     user = get_user(cid)
     code = user.get("ref_code", _gen_ref())
+    if not user.get("ref_code"):
+        user["ref_code"] = code
+        save_user(cid, user)
+
+    if BOT_USERNAME:
+        ref_link = f"https://t.me/{BOT_USERNAME}?start={code}"
+    else:
+        ref_link = f"ваш_бот?start={code} (имя бота не определено — перезапустите)"
+
+    count   = user.get("ref_count", 0)
+    bonus   = user.get("ref_bonus", 0.0)
+    ref_by  = user.get("ref_by")
+
     text = (
         "🤝 <b>Реферальная программа</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "За каждого приглашённого: <b>5% от его прибыли</b>\n\n"
-        f"Ваш код: <code>{code}</code>\n"
-        f"Рефералов: {user.get('ref_count', 0)}\n"
-        f"Заработано: <b>${fmt(user.get('ref_bonus', 0))}</b>\n\n"
-        f"Ссылка для приглашения:\n"
-        f"<code>https://t.me/ваш_бот?start={code}</code>"
+        "За каждого приглашённого друга:\n"
+        "  • <b>5% от его прибыли</b> — вам на счёт\n"
+        "  • Другу — <b>+$10 к демо-балансу</b> при регистрации\n\n"
+        f"📎 Ваша ссылка:\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"👥 Приглашено: <b>{count}</b> чел.\n"
+        f"💰 Заработано: <b>${fmt(bonus)}</b>\n"
+        + (f"🔗 Вас пригласил: ID {ref_by}\n" if ref_by else "")
     )
     send(cid, text, kb_back())
 
@@ -2158,8 +2211,10 @@ def process_update(update):
             PENDING_INPUTS[cid] = "dep_custom"
             send(cid, "✏️ Введите сумму пополнения (минимум $50):", kb_back())
         elif data.startswith("depsent_"):
-            amount = float(data.split("_")[1])
+            amount   = float(data.split("_")[1])
+            username = cb["from"].get("username") or cb["from"].get("first_name", "?")
             if is_admin(cid):
+                # Администратор подтверждает себе сам
                 user = get_user(cid)
                 user["real"]["deposited"] += amount
                 user["real"]["balance"]   += amount
@@ -2170,12 +2225,67 @@ def process_update(update):
                 send(cid, f"✅ Баланс пополнен на <b>${fmt(amount)}</b>!\n"
                           f"Текущий баланс: <b>${fmt(user['real']['balance'])}</b>")
             else:
+                # Сохраняем заявку и отправляем КНОПКИ администратору
+                add_pending_deposit(cid, amount, username)
                 send(ADMIN_ID,
-                     f"💰 <b>НОВЫЙ ДЕПОЗИТ</b>\n"
-                     f"Пользователь: {cid} ({cb['from'].get('username','?')})\n"
-                     f"Сумма: <b>${fmt(amount)}</b>\n"
-                     f"Подтвердите: /confirm_{cid}_{amount}")
-                send(cid, "⏳ Заявка отправлена администратору. Ожидайте подтверждения (10-30 мин)")
+                     f"💰 <b>НОВЫЙ ЗАПРОС НА ПОПОЛНЕНИЕ</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                     f"👤 Пользователь: @{username} (ID: <code>{cid}</code>)\n"
+                     f"💵 Сумма: <b>${fmt(amount)}</b>\n"
+                     f"🕐 Время: {ts()}\n\n"
+                     f"Проверьте поступление на кошелёк и нажмите кнопку:",
+                     kb_admin_dep(cid, amount))
+                send(cid,
+                     f"⏳ <b>Заявка на пополнение отправлена!</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                     f"💵 Сумма: <b>${fmt(amount)}</b>\n"
+                     f"🕐 Ожидайте подтверждения администратора (10-30 мин)\n\n"
+                     f"Как только платёж придёт — деньги зачислятся автоматически ✅")
+        elif data.startswith("dep_ok_"):
+            # Администратор подтверждает платёж
+            if not is_admin(cid):
+                return
+            _, _, uid, a_cents = data.split("_", 3)
+            amount = int(a_cents) / 100
+            user   = get_user(uid)
+            user["real"]["deposited"] += amount
+            user["real"]["balance"]   += amount
+            user["real"]["active"]     = True
+            if user["real"]["balance"] > user["real"].get("peak", 0):
+                user["real"]["peak"] = user["real"]["balance"]
+            save_user(uid, user)
+            remove_pending_deposit(uid)
+            # Уведомляем администратора
+            send(cid,
+                 f"✅ <b>Платёж подтверждён!</b>\n"
+                 f"Пользователь ID: <code>{uid}</code>\n"
+                 f"Зачислено: <b>${fmt(amount)}</b>")
+            # Уведомляем пользователя
+            send(uid,
+                 f"✅ <b>Пополнение подтверждено!</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"💵 Зачислено: <b>${fmt(amount)}</b>\n"
+                 f"💳 Текущий баланс: <b>${fmt(user['real']['balance'])}</b>\n"
+                 f"🚀 Деньги уже в работе — бот торгует на ваш счёт!\n"
+                 f"🕐 {ts()}")
+
+        elif data.startswith("dep_no_"):
+            # Администратор отклоняет платёж
+            if not is_admin(cid):
+                return
+            _, _, uid, a_cents = data.split("_", 3)
+            amount = int(a_cents) / 100
+            remove_pending_deposit(uid)
+            send(cid,
+                 f"❌ <b>Платёж отклонён.</b>\n"
+                 f"Пользователь ID: <code>{uid}</code> | Сумма: ${fmt(amount)}")
+            send(uid,
+                 f"❌ <b>Пополнение не подтверждено</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"💵 Сумма: ${fmt(amount)}\n\n"
+                 f"Платёж не найден или не прошёл. Если вы точно отправили — "
+                 f"напишите в поддержку с чеком транзакции.")
+
         elif data.startswith("withdraw"):
             user = get_user(cid)
             bal  = user["real"]["balance"]
@@ -2577,12 +2687,31 @@ def run():
         logger.info("🎮 DEMO режим — торговля симулируется")
 
     if TOKEN:
+        # Получаем имя бота для реферальных ссылок
+        global BOT_USERNAME
+        me = api("getMe")
+        if me.get("ok"):
+            BOT_USERNAME = me["result"].get("username", "")
+            logger.info("🤖 Бот: @%s", BOT_USERNAME)
+
         poll_telegram()
         if ADMIN_ID:
             # Автоматически регистрируем администратора, если ещё нет в базе
             # Это гарантирует получение всех уведомлений без ручного /start
             get_user(ADMIN_ID)
             logger.info("✅ Администратор %s зарегистрирован в базе пользователей", ADMIN_ID)
+
+            # Проверяем ожидающие подтверждения депозиты
+            pending = load_pending_deposits()
+            if pending:
+                lines = "\n".join(
+                    f"  • ID {uid}: ${fmt(d['amount'])} от @{d.get('username','?')} ({d.get('time','')})"
+                    for uid, d in pending.items()
+                )
+                send(ADMIN_ID,
+                     f"⏳ <b>Ожидают подтверждения {len(pending)} депозит(а):</b>\n{lines}\n\n"
+                     f"Чтобы подтвердить — попросите пользователя нажать «Я отправил платёж» ещё раз, "
+                     f"или зайдите в Депозиты в админ-панели.")
 
             mode_lbl = f"🟢 LIVE Bybit ({'Testnet' if USE_TESTNET else 'Mainnet'})" if LIVE_MODE else "🎮 DEMO"
             send(ADMIN_ID,
