@@ -463,44 +463,71 @@ def _bybit_sign(payload_str: str, ts: int) -> str:
     ).hexdigest()
 
 
+# Флаг: Bybit вернул HTML вместо JSON (IP заблокирован) → прекращаем авторизованные вызовы
+_bybit_ip_blocked = False
+
 def bybit_request(method, endpoint, params=None):
-    """Подписанный запрос к Bybit API v5 (GET и POST обрабатываются по-разному)"""
-    if not LIVE_MODE:
+    """Подписанный запрос к Bybit API v5.
+    Если Bybit возвращает не-JSON (HTML-страница блокировки IP) —
+    автоматически переключаемся в режим без Bybit на эту сессию.
+    """
+    global _bybit_ip_blocked
+    if not LIVE_MODE or _bybit_ip_blocked:
         return {"retCode": 0, "result": {}}
     params = params or {}
-    ts     = int(time.time() * 1000)
+    ts_ms  = int(time.time() * 1000)
     base   = _bybit_url()
     try:
         if method == "GET":
-            # Для GET: подпись от строки query-параметров
             query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-            sign = _bybit_sign(query_string, ts)
+            sign = _bybit_sign(query_string, ts_ms)
             headers = {
                 "X-BAPI-API-KEY":     BYBIT_KEY,
                 "X-BAPI-SIGN":        sign,
-                "X-BAPI-TIMESTAMP":   str(ts),
+                "X-BAPI-TIMESTAMP":   str(ts_ms),
                 "X-BAPI-RECV-WINDOW": "5000",
             }
             resp = requests.get(f"{base}{endpoint}", params=params, headers=headers, timeout=15)
         else:
-            # Для POST: подпись от JSON-тела запроса
             body = json.dumps(params, separators=(",", ":"))
-            sign = _bybit_sign(body, ts)
+            sign = _bybit_sign(body, ts_ms)
             headers = {
                 "X-BAPI-API-KEY":     BYBIT_KEY,
                 "X-BAPI-SIGN":        sign,
-                "X-BAPI-TIMESTAMP":   str(ts),
+                "X-BAPI-TIMESTAMP":   str(ts_ms),
                 "X-BAPI-RECV-WINDOW": "5000",
                 "Content-Type":       "application/json",
             }
             resp = requests.post(f"{base}{endpoint}", data=body, headers=headers, timeout=15)
+
+        # Проверяем что ответ — JSON, а не HTML (страница блокировки IP)
+        content_type = resp.headers.get("Content-Type", "")
+        if "html" in content_type or (resp.text and resp.text.strip().startswith("<")):
+            _bybit_ip_blocked = True
+            logger.warning("⚠️ Bybit API недоступен с текущего IP (Railway) — "
+                           "переключаюсь в DEMO режим. Установите DEMO_MODE=true в Railway Variables.")
+            if ADMIN_ID:
+                send(ADMIN_ID,
+                     "⚠️ <b>Bybit API заблокирован с IP сервера Railway.</b>\n"
+                     "Бот переключён в DEMO режим.\n\n"
+                     "Чтобы убрать это сообщение: Railway → Variables → "
+                     "добавьте <code>DEMO_MODE=true</code>")
+            return {}
+
         result = resp.json()
         if result.get("retCode") not in (0, None):
             logger.warning("Bybit %s %s → %s: %s",
                            method, endpoint, result.get("retCode"), result.get("retMsg"))
         return result
+    except json.JSONDecodeError:
+        # Пустой или нечитаемый ответ — скорее всего IP заблокирован
+        _bybit_ip_blocked = True
+        logger.warning("⚠️ Bybit вернул нечитаемый ответ на %s %s — "
+                       "переключаюсь в DEMO (добавьте DEMO_MODE=true в Railway Variables)",
+                       method, endpoint)
+        return {}
     except Exception as e:
-        logger.error("bybit_request %s %s: %s", method, endpoint, e)
+        logger.warning("bybit_request %s %s: %s", method, endpoint, e)
         return {}
 
 
