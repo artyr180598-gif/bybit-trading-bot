@@ -1026,6 +1026,8 @@ def check_exits(pair, price, df4h):
              (side == "SHORT" and price <= pos["tp"])
 
     if hit_sl:
+        open_ts = pos.get("time", "")
+        dur     = time_since(open_ts) if open_ts else "—"
         t   = do_close(pair, price, "STOP-LOSS")
         if t:
             pnl  = t["pnl"]
@@ -1033,14 +1035,17 @@ def check_exits(pair, price, df4h):
                 f"⛔ <b>СТОП-ЛОСС | {pair['emoji']} {pair['name']} {side}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Вход: <b>${fmt(pos['entry'])}</b> → Выход: <b>${fmt(price)}</b>\n"
+                f"⏱ Время в позиции: {dur}\n"
                 f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code> "
                 f"({sign(t['pnl_pct'])}{t['pnl_pct']:.1f}%)\n"
                 f"🕐 {ts()}"
             )
-            notify_all_users(msg)
+            notify_all_users(msg, critical=True)
         return True
 
     if hit_tp:
+        open_ts = pos.get("time", "")
+        dur     = time_since(open_ts) if open_ts else "—"
         t   = do_close(pair, price, "TAKE-PROFIT")
         if t:
             pnl  = t["pnl"]
@@ -1048,14 +1053,17 @@ def check_exits(pair, price, df4h):
                 f"🎯 <b>ТЕЙК-ПРОФИТ | {pair['emoji']} {pair['name']} {side}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Вход: <b>${fmt(pos['entry'])}</b> → Выход: <b>${fmt(price)}</b>\n"
+                f"⏱ Время в позиции: {dur}\n"
                 f"P&L: <code>+${fmt(pnl)}</code> "
                 f"({sign(t['pnl_pct'])}{t['pnl_pct']:.1f}%)\n"
                 f"🕐 {ts()}"
             )
-            notify_all_users(msg)
+            notify_all_users(msg, critical=True)
         return True
 
     if df4h is not None and check_exit_signal(df4h, side):
+        open_ts = pos.get("time", "")
+        dur     = time_since(open_ts) if open_ts else "—"
         t   = do_close(pair, price, "SIGNAL-EXIT")
         if t:
             pnl  = t["pnl"]
@@ -1064,10 +1072,11 @@ def check_exits(pair, price, df4h):
                 f"{icon} <b>ВЫХОД | {pair['emoji']} {pair['name']} {side}</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Вход: ${fmt(pos['entry'])} → Выход: ${fmt(price)}\n"
+                f"⏱ Время в позиции: {dur}\n"
                 f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code>\n"
                 f"🕐 {ts()}"
             )
-            notify_all_users(msg)
+            notify_all_users(msg, critical=True)
         return True
 
     return False
@@ -1152,6 +1161,22 @@ def pct_val(profit, base):
 
 def wr_calc(w, l):
     return round(w / max(w + l, 1) * 100)
+
+def time_since(ts_str):
+    """Время прошедшее с момента открытия позиции (строка вида '29.03.2026 14:32 UTC')"""
+    try:
+        dt    = datetime.strptime(ts_str, "%d.%m.%Y %H:%M UTC").replace(tzinfo=timezone.utc)
+        secs  = int((datetime.now(timezone.utc) - dt).total_seconds())
+        if secs < 0:
+            return "—"
+        h, m  = divmod(secs // 60, 60)
+        if h >= 24:
+            return f"{h//24}д {h%24}ч"
+        if h > 0:
+            return f"{h}ч {m}м"
+        return f"{m}м"
+    except Exception:
+        return "—"
 
 # ─── ПОЛЬЗОВАТЕЛИ ─────────────────────────────────────────────────────────────
 
@@ -1240,14 +1265,19 @@ def remove_pending_deposit(uid):
 
 # ─── УВЕДОМЛЕНИЯ ВСЕМ ПОЛЬЗОВАТЕЛЯМ ──────────────────────────────────────────
 
-def notify_all_users(text):
-    """Отправить сообщение всем пользователям с включёнными уведомлениями.
-    Администратор всегда получает уведомления, даже если не писал /start.
+def notify_all_users(text, critical=False):
+    """
+    Отправить сообщение всем пользователям с включёнными уведомлениями.
+    critical=True  — важные события (открытие/закрытие позиции, SL/TP)
+                     приходят ВСЕМ у кого notify=True
+    critical=False — информационные обновления (hourly сканы)
+                     НЕ приходят пользователям в тихом режиме (quiet_mode=True)
+    Администратор ВСЕГДА получает ВСЕ уведомления.
     """
     users = load_users()
     sent  = set()
 
-    # Администратор получает ВСЕ уведомления о сделках
+    # Администратор получает ВСЕ уведомления
     if ADMIN_ID:
         try:
             send(ADMIN_ID, text)
@@ -1257,11 +1287,15 @@ def notify_all_users(text):
 
     # Остальные зарегистрированные пользователи
     for uid, u in users.items():
-        if uid not in sent and u.get("notify", True):
-            try:
-                send(uid, text)
-            except Exception:
-                pass
+        if uid in sent or not u.get("notify", True):
+            continue
+        # Тихий режим: пропускаем не-критические уведомления
+        if not critical and u.get("quiet_mode", False):
+            continue
+        try:
+            send(uid, text)
+        except Exception:
+            pass
 
 # ─── РАСПРЕДЕЛЕНИЕ ПРИБЫЛИ ────────────────────────────────────────────────────
 
@@ -1591,7 +1625,8 @@ def kb_demo_positions(poss):
     rows.append([{"text": "◀️ Демо-торговля", "callback_data": "demo_trade"}])
     return rows
 
-def kb_account():
+def kb_account(quiet=False):
+    quiet_lbl = "🔕 Тихий режим: ВКЛ" if quiet else "🔔 Тихий режим: ВЫКЛ"
     return [
         [{"text": "🎮 Демо-трейдинг",  "callback_data": "demo_trade"},
          {"text": "💼 Реальный счёт",  "callback_data": "real"}],
@@ -1599,6 +1634,8 @@ def kb_account():
          {"text": "🏆 Лидерборд",      "callback_data": "leaderboard"}],
         [{"text": "💰 Пополнить",      "callback_data": "deposit"},
          {"text": "💸 Вывести",       "callback_data": "withdraw"}],
+        [{"text": "🔔 Уведомления",    "callback_data": "toggle_notify"},
+         {"text": quiet_lbl,           "callback_data": "toggle_quiet"}],
         [{"text": "🏠 Главное меню",   "callback_data": "menu"}],
     ]
 
@@ -1829,6 +1866,12 @@ def screen_stats(cid):
     longs  = [t for t in closes if t.get("side") == "LONG"]
     shorts = [t for t in closes if t.get("side") == "SHORT"]
 
+    # Лучшая и худшая сделка
+    best_t  = max(closes, key=lambda t: t.get("pnl", 0), default=None)
+    worst_t = min(closes, key=lambda t: t.get("pnl", 0), default=None)
+    best_str  = (f"{best_t.get('pair','?')} <code>+${fmt(best_t['pnl'])}</code>")  if best_t  else "—"
+    worst_str = (f"{worst_t.get('pair','?')} <code>-${fmt(abs(worst_t['pnl']))}</code>") if worst_t else "—"
+
     pos_text = ""
     for pair in PAIRS:
         s   = BOT_STATES.get(pair["symbol"], {})
@@ -1838,8 +1881,10 @@ def screen_stats(cid):
             fl   = (pr - pos["entry"]) * pos["qty"] * LEVERAGE
             if side == "SHORT":
                 fl = -fl
+            dur = time_since(pos.get("time", ""))
             pos_text += (
-                f"\n{pair['emoji']} {pair['name']} {side}: вход ${fmt(pos['entry'])} | "
+                f"\n{pair['emoji']} {pair['name']} {side} ({dur}): "
+                f"вход ${fmt(pos['entry'])} | "
                 f"Float: <code>{sign(fl)}${fmt(abs(fl))}</code>"
             )
 
@@ -1853,7 +1898,9 @@ def screen_stats(cid):
         f"  Суммарный P&L:    <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
         f"  Средний выигрыш:  ${fmt(win_avg)}\n"
         f"  Средний убыток:   ${fmt(abs(loss_avg))}\n"
-        f"  R:R:              {rr:.2f}\n\n"
+        f"  R:R:              {rr:.2f}\n"
+        f"  🏆 Лучшая:        {best_str}\n"
+        f"  💀 Худшая:         {worst_str}\n\n"
         "<b>Баланс по парам:</b>\n"
     )
     for pair in PAIRS:
@@ -2202,9 +2249,11 @@ def screen_account(cid):
         f"  Реинвест: {'✅' if r.get('autocompound', True) else '❌'}\n"
         f"  Статус:   {'✅ Активен' if r['active'] else '⏸ Неактивен'}\n\n"
         f"🤝 Рефералов: {user.get('ref_count',0)} | Реф.бонус: ${fmt(user.get('ref_bonus',0))}\n"
-        f"📅 С нами с: {user['joined']}"
+        f"📅 С нами с: {user['joined']}\n\n"
+        f"🔔 Уведомления: {'ВКЛ' if user.get('notify', True) else 'ВЫКЛ'}  |  "
+        f"Тихий режим: {'ВКЛ 🔕' if user.get('quiet_mode', False) else 'ВЫКЛ 🔔'}"
     )
-    send(cid, text, kb_account())
+    send(cid, text, kb_account(quiet=user.get("quiet_mode", False)))
 
 
 def screen_deposit(cid):
@@ -2486,6 +2535,23 @@ def process_update(update):
             screen_admin(cid)
         elif text == "/strategy":
             screen_strategy(cid)
+        elif text in ("/help", "/помощь"):
+            send(cid,
+                 "ℹ️ <b>Доступные команды</b>\n"
+                 "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 "<b>Основные:</b>\n"
+                 "/start — главное меню\n"
+                 "/balance — мой баланс и режим\n"
+                 "/demo — демо-трейдинг\n"
+                 "/stats — статистика бота\n"
+                 "/market — рынок прямо сейчас\n"
+                 "/strategy — описание стратегии\n\n"
+                 "<b>Технические:</b>\n"
+                 "/debug — диагностика подключения\n"
+                 "/help — эта справка\n\n"
+                 "<b>Навигация:</b>\n"
+                 "Все функции доступны через кнопки меню — просто нажми /start.",
+                 kb_back())
         else:
             screen_main(cid)
 
@@ -2757,7 +2823,30 @@ def process_update(update):
             user["notify"] = not user.get("notify", True)
             save_user(cid, user)
             state = "включены 🔔" if user["notify"] else "выключены 🔕"
-            send(cid, f"Уведомления {state}", kb_back())
+            send(cid, f"Уведомления {state}\n\n"
+                      f"Если хочешь получать только важные уведомления (открытие/закрытие позиций, SL/TP),\n"
+                      f"включи Тихий режим — часовые сводки по рынку не будут приходить.",
+                 kb_back())
+        elif data == "toggle_quiet":
+            user = get_user(cid)
+            user["quiet_mode"] = not user.get("quiet_mode", False)
+            save_user(cid, user)
+            if user["quiet_mode"]:
+                send(cid,
+                     "🔕 <b>Тихий режим включён</b>\n\n"
+                     "Вы будете получать только важные уведомления:\n"
+                     "• Открытие позиции\n"
+                     "• Закрытие / SL / TP\n"
+                     "• Личный P&L при закрытии\n"
+                     "• Достижения и милстоуны\n\n"
+                     "Часовые сводки рынка отключены.",
+                     kb_back())
+            else:
+                send(cid,
+                     "🔔 <b>Тихий режим выключен</b>\n\n"
+                     "Вы снова будете получать все уведомления включая\n"
+                     "часовые сводки рынка.",
+                     kb_back())
         elif data.startswith("adm_") and is_admin(cid):
             handle_admin_cb(cid, data)
 
@@ -2906,7 +2995,7 @@ def trading_loop():
                                      f"⚖️ Риск: {RISK_PCT}% | Плечо: {LEVERAGE}x | Demo режим\n"
                                      f"🕐 {ts()}"
                                 )
-                                notify_all_users(open_msg)
+                                notify_all_users(open_msg, critical=True)
                                 scan_lines.append(f"  {pair['emoji']} {pair['name']}: {icon} ВХОД {sig} @ ${fmt(price)}")
                         else:
                             pos = s.get("pos")
