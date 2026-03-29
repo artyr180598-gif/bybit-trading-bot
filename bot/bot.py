@@ -1450,6 +1450,16 @@ def pool_release(pair_name, pnl, is_win):
         u["demo"]    = d
         users[uid]   = u
 
+        # Реферальный бонус: 5% от прибыли уходит реферреру
+        if user_pnl > 0 and u.get("ref_by"):
+            ref_id  = u["ref_by"]
+            ref_cut = round(user_pnl * 0.05, 4)
+            ru      = users.get(str(ref_id))
+            if ru:
+                ru["demo"]["balance"] = round(ru["demo"].get("balance", 0) + ref_cut, 4)
+                ru["ref_bonus"]       = round(ru.get("ref_bonus", 0) + ref_cut, 4)
+                users[str(ref_id)]    = ru
+
         # Личное уведомление пользователю о результате
         if u.get("notify", True):
             icon     = "✅" if is_win else "❌"
@@ -2229,8 +2239,8 @@ def screen_referral(cid):
         "🤝 <b>Реферальная программа</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "За каждого приглашённого друга:\n"
-        "  • <b>5% от его прибыли</b> — вам на счёт\n"
-        "  • Другу — <b>+$10 к демо-балансу</b> при регистрации\n\n"
+        "  • <b>5% от его прибыли</b> — автоматически на ваш демо-счёт\n"
+        "  • Другу — <b>+$50 к демо-балансу</b> при регистрации\n\n"
         f"📎 Ваша ссылка:\n"
         f"<code>{ref_link}</code>\n\n"
         f"👥 Приглашено: <b>{count}</b> чел.\n"
@@ -2442,6 +2452,11 @@ def process_update(update):
                 abs(user.get("demo", {}).get("balance", 1000) - 1000) > 0.01
             )
             if not user.get("welcomed") and not has_history:
+                # Реферальный бонус другу: +$50 к демо если пришёл по ссылке
+                if user.get("ref_by"):
+                    bonus_amount = 50.0
+                    user["demo"]["balance"] = round(user["demo"].get("balance", 1000) + bonus_amount, 4)
+                    user["demo"]["start"]   = user["demo"]["balance"]  # пересчитываем старт
                 # Новый пользователь — показываем приветственный экран один раз
                 user["welcomed"] = True
                 save_user(cid, user)
@@ -2685,18 +2700,30 @@ def process_update(update):
         elif data == "demo_reset":
             user = get_user(cid)
             d    = user["demo"]
-            # Закрыть все позиции без расчёта P&L
-            d["positions"] = []
-            d["balance"]   = 1000.0
-            d["start"]     = 1000.0
-            d["peak"]      = 1000.0
-            d["profit"]    = 0.0
-            d["trades"]    = 0
-            d["wins"]      = 0
-            d["loss"]      = 0
-            d["history"]   = []
-            d["streak_win"]  = 0
-            d["streak_loss"] = 0
+            # Если пользователь сбрасывает баланс пока деньги в пуле — снимаем их с пула
+            locked_now = d.get("locked", 0)
+            if locked_now > 0:
+                # Убираем долю этого пользователя из locked_by_pair бота
+                # (деньги просто списываем — позиция у бота останется, но баланс у этого юзера будет чистый)
+                lbp = d.get("locked_by_pair", {})
+                for pair_name, pair_locked in lbp.items():
+                    # Корректируем пул других пользователей не трогаем — просто обнуляем у этого
+                    pass  # pool_release обработает правильно когда позиция закроется
+            # Сброс демо-счёта
+            d["positions"]    = []
+            d["balance"]      = 1000.0
+            d["start"]        = 1000.0
+            d["peak"]         = 1000.0
+            d["profit"]       = 0.0
+            d["trades"]       = 0
+            d["wins"]         = 0
+            d["loss"]         = 0
+            d["history"]      = []
+            d["streak_win"]   = 0
+            d["streak_loss"]  = 0
+            d["locked"]       = 0.0   # ← FIX: очищаем замороженные средства
+            d["locked_by_pair"] = {}  # ← FIX: очищаем учёт по парам
+            d["max_dd"]       = 0.0
             save_user(cid, user)
             send(cid, "🔄 <b>Демо-баланс сброшен!</b>\nСтартовый баланс: <b>$1,000</b>", kb_demo_back())
 
