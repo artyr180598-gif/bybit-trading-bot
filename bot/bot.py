@@ -2307,16 +2307,78 @@ def process_update(update):
         cb_id = cb["id"]
         answer_cb(cb_id)
 
-        # Депозиты
-        if data.startswith("dep_") and data != "dep_custom":
-            amount = int(data.split("_")[1])
+        # ── ДЕПОЗИТЫ: ПОДТВЕРЖДЕНИЕ/ОТКЛОНЕНИЕ (проверяем ПЕРВЫМИ, до общего dep_) ──
+
+        if data.startswith("dep_ok_"):
+            # Администратор подтверждает платёж
+            if not is_admin(cid):
+                answer_cb(cb_id, "⛔ Нет доступа")
+                return
+            try:
+                _, _, uid, a_cents = data.split("_", 3)
+                amount = int(a_cents) / 100
+            except Exception:
+                answer_cb(cb_id, "⚠️ Ошибка разбора данных")
+                return
+            user = get_user(uid)
+            user["real"]["deposited"] += amount
+            user["real"]["balance"]   += amount
+            user["real"]["active"]     = True
+            if user["real"]["balance"] > user["real"].get("peak", 0):
+                user["real"]["peak"] = user["real"]["balance"]
+            save_user(uid, user)
+            remove_pending_deposit(uid)
+            send(cid,
+                 f"✅ <b>Платёж подтверждён!</b>\n"
+                 f"Пользователь ID: <code>{uid}</code>\n"
+                 f"Зачислено: <b>${fmt(amount)}</b>\n"
+                 f"Новый баланс: <b>${fmt(user['real']['balance'])}</b>")
+            send(uid,
+                 f"✅ <b>Пополнение подтверждено!</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"💵 Зачислено: <b>${fmt(amount)}</b>\n"
+                 f"💳 Текущий баланс: <b>${fmt(user['real']['balance'])}</b>\n"
+                 f"🚀 Деньги уже в работе — бот торгует на ваш счёт!\n"
+                 f"🕐 {ts()}")
+
+        elif data.startswith("dep_no_"):
+            # Администратор отклоняет платёж
+            if not is_admin(cid):
+                answer_cb(cb_id, "⛔ Нет доступа")
+                return
+            try:
+                _, _, uid, a_cents = data.split("_", 3)
+                amount = int(a_cents) / 100
+            except Exception:
+                answer_cb(cb_id, "⚠️ Ошибка разбора данных")
+                return
+            remove_pending_deposit(uid)
+            send(cid,
+                 f"❌ <b>Платёж отклонён.</b>\n"
+                 f"Пользователь ID: <code>{uid}</code> | Сумма: ${fmt(amount)}")
+            send(uid,
+                 f"❌ <b>Пополнение не подтверждено</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"💵 Сумма: ${fmt(amount)}\n\n"
+                 f"Платёж не найден или не прошёл. Если вы точно отправили — "
+                 f"напишите в поддержку с чеком транзакции.")
+
+        # ── ВЫБОР СУММЫ ДЕПОЗИТА (кнопки dep_50, dep_100 и т.п.) ──
+        elif data.startswith("dep_") and data not in ("dep_custom",) \
+                and not data.startswith(("dep_ok_", "dep_no_", "depsent_")):
+            try:
+                amount = int(data.split("_")[1])
+            except (IndexError, ValueError):
+                return
             send(cid,
                  f"💳 Переведите <b>${fmt(amount)}</b> USDT (TRC-20):\n"
                  f"<code>{WALLET}</code>",
                  kb_confirm_dep(amount))
+
         elif data == "dep_custom":
             PENDING_INPUTS[cid] = "dep_custom"
             send(cid, "✏️ Введите сумму пополнения (минимум $50):", kb_back())
+
         elif data.startswith("depsent_"):
             amount   = float(data.split("_")[1])
             username = cb["from"].get("username") or cb["from"].get("first_name", "?")
@@ -2348,50 +2410,6 @@ def process_update(update):
                      f"💵 Сумма: <b>${fmt(amount)}</b>\n"
                      f"🕐 Ожидайте подтверждения администратора (10-30 мин)\n\n"
                      f"Как только платёж придёт — деньги зачислятся автоматически ✅")
-        elif data.startswith("dep_ok_"):
-            # Администратор подтверждает платёж
-            if not is_admin(cid):
-                return
-            _, _, uid, a_cents = data.split("_", 3)
-            amount = int(a_cents) / 100
-            user   = get_user(uid)
-            user["real"]["deposited"] += amount
-            user["real"]["balance"]   += amount
-            user["real"]["active"]     = True
-            if user["real"]["balance"] > user["real"].get("peak", 0):
-                user["real"]["peak"] = user["real"]["balance"]
-            save_user(uid, user)
-            remove_pending_deposit(uid)
-            # Уведомляем администратора
-            send(cid,
-                 f"✅ <b>Платёж подтверждён!</b>\n"
-                 f"Пользователь ID: <code>{uid}</code>\n"
-                 f"Зачислено: <b>${fmt(amount)}</b>")
-            # Уведомляем пользователя
-            send(uid,
-                 f"✅ <b>Пополнение подтверждено!</b>\n"
-                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                 f"💵 Зачислено: <b>${fmt(amount)}</b>\n"
-                 f"💳 Текущий баланс: <b>${fmt(user['real']['balance'])}</b>\n"
-                 f"🚀 Деньги уже в работе — бот торгует на ваш счёт!\n"
-                 f"🕐 {ts()}")
-
-        elif data.startswith("dep_no_"):
-            # Администратор отклоняет платёж
-            if not is_admin(cid):
-                return
-            _, _, uid, a_cents = data.split("_", 3)
-            amount = int(a_cents) / 100
-            remove_pending_deposit(uid)
-            send(cid,
-                 f"❌ <b>Платёж отклонён.</b>\n"
-                 f"Пользователь ID: <code>{uid}</code> | Сумма: ${fmt(amount)}")
-            send(uid,
-                 f"❌ <b>Пополнение не подтверждено</b>\n"
-                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                 f"💵 Сумма: ${fmt(amount)}\n\n"
-                 f"Платёж не найден или не прошёл. Если вы точно отправили — "
-                 f"напишите в поддержку с чеком транзакции.")
 
         elif data.startswith("withdraw"):
             user = get_user(cid)
