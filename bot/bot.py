@@ -57,12 +57,17 @@ ADMIN_IDS   = os.environ.get("ADMIN_IDS", ADMIN_ID)
 WALLET      = os.environ.get("USDT_WALLET", "ЗАДАЙТЕ_USDT_WALLET")
 
 # Bybit API (для реальной торговли)
-BYBIT_KEY    = os.environ.get("BYBIT_API_KEY", "")
-BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+BYBIT_KEY    = os.environ.get("BYBIT_API_KEY", "").strip()
+BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "").strip()
 USE_TESTNET  = os.environ.get("BYBIT_TESTNET", "true").lower() == "true"
 LEVERAGE     = int(os.environ.get("BYBIT_LEVERAGE", "3"))
 
-LIVE_MODE = bool(BYBIT_KEY and BYBIT_SECRET)
+# LIVE_MODE = True только если ключи реально заполнены и не заглушки
+_keys_ok   = (bool(BYBIT_KEY and BYBIT_SECRET)
+              and len(BYBIT_KEY) > 10
+              and BYBIT_KEY not in ("your_api_key_here", "YOUR_KEY"))
+_demo_env  = os.environ.get("DEMO_MODE", "false").lower() == "true"
+LIVE_MODE  = _keys_ok and not _demo_env
 
 DATA_DIR   = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -840,22 +845,31 @@ def do_open(pair, price, atr, side):
         qty           = max(qty, pair["min_qty"])
         margin_needed = qty * price / LEVERAGE
 
-    # Реальный ордер на Bybit
-    if LIVE_MODE:
+    # Реальный ордер на Bybit (только если LIVE_MODE и ключи валидны)
+    _use_live = LIVE_MODE
+    if _use_live:
         set_leverage(sym)
         order_side = "Buy" if side == "LONG" else "Sell"
         result     = place_order(sym, order_side, qty, sl, tp)
-        if result.get("retCode") != 0:
-            logger.error("Ошибка ордера %s: %s", sym, result.get("retMsg"))
-            return None
-        order_id = result.get("result", {}).get("orderId", "")
-    else:
+        ret_code   = result.get("retCode", -1)
+        ret_msg    = result.get("retMsg", "unknown")
+        if ret_code != 0:
+            if ret_code in (10003, 10004, 10005):  # невалидный API ключ
+                logger.error("Ошибка ордера %s: %s — переключаюсь в DEMO", sym, ret_msg)
+                _use_live = False   # автофолбэк в демо
+            else:
+                logger.error("Ошибка ордера %s: %s", sym, ret_msg)
+                return None
+        else:
+            order_id = result.get("result", {}).get("orderId", "")
+
+    if not _use_live:
         order_id = f"DEMO_{sym}_{int(time.time())}"
 
     margin = round(qty * price / LEVERAGE, 4)
 
     # Заморозить деньги у пользователей (берём из их балансов)
-    if not LIVE_MODE:
+    if not _use_live:
         locks = pool_lock(pair["name"], margin)
         # Уведомляем каждого пользователя о заморозке
         if locks:
