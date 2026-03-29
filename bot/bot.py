@@ -2409,18 +2409,54 @@ def screen_mode_info(cid):
                 "• Аккаунт на testnet.bybit.com пополнен"
             )
     else:
+        # Показываем личные данные пользователя — не технические инструкции
+        user   = get_user(cid)
+        d      = user["demo"]
+        profit = d["balance"] - d.get("start", 1000)
+        d_pct  = pct_val(profit, d.get("start", 1000))
+        wr     = wr_calc(d.get("wins", 0), d.get("loss", 0))
+
+        # Открытые позиции бота
+        pos_lines = ""
+        open_n    = 0
+        for pair in PAIRS:
+            s   = BOT_STATES.get(pair["symbol"], {})
+            pos = s.get("pos")
+            if pos:
+                open_n += 1
+                price = fetch_price(pair["symbol"]) or pos["entry"]
+                side  = pos["side"]
+                fl    = (price - pos["entry"]) * pos["qty"] * LEVERAGE
+                if side == "SHORT":
+                    fl = -fl
+                dur = time_since(pos.get("time", ""))
+                pos_lines += (
+                    f"\n  {pair['emoji']} {pair['name']} {side} ({dur})"
+                    f" → Float: <code>{sign(fl)}${fmt(abs(fl))}</code>"
+                )
+
+        profit_icon = "📈" if profit >= 0 else "📉"
         text = (
-            "🎮 <b>Режим: DEMO (Симуляция)</b>\n"
+            "🎮 <b>Демо-режим</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Реальные цены Bybit, виртуальные сделки.\n\n"
-            "Чтобы включить реальную торговлю:\n"
-            "1. Зайди на <b>testnet.bybit.com</b>\n"
-            "2. API → создай ключ с правами Trade + Read\n"
-            "3. В Railway добавь переменные:\n"
-            "   BYBIT_API_KEY = ...\n"
-            "   BYBIT_API_SECRET = ...\n"
-            "   BYBIT_TESTNET = true\n"
-            "4. Redeploy — и бот торгует реально!"
+            f"💼 Твой баланс:   <b>${fmt(d['balance'])}</b>\n"
+            f"{profit_icon} Прибыль:       <code>{sign(profit)}${fmt(abs(profit))}"
+            f"  ({sign(d_pct)}{d_pct:.1f}%)</code>\n"
+            f"🎯 Сделок:        {d.get('trades', 0)}"
+            f"  |  WR: {wr}%\n"
+            f"📌 Открытых позиций: {open_n}/{MAX_POS}"
+        )
+        if pos_lines:
+            text += f"\n{pos_lines}"
+        text += (
+            "\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "ℹ️ <b>Что такое демо?</b>\n"
+            "Бот торгует на реальных ценах крипторынка,\n"
+            "но использует виртуальные $1,000 — "
+            "реальные деньги не задействованы.\n\n"
+            "💡 Хочешь торговать реально? Нажми\n"
+            "<b>«Пополнить»</b> в главном меню."
         )
     send(cid, text, kb_back())
 
