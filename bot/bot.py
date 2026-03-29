@@ -114,8 +114,8 @@ MACD_SLOW    = 26
 MACD_SIG     = 9
 RISK_PCT     = 2.0    # 2% риска на сделку
 MAX_POS      = 3
-DAY_LOSS_PCT = 6.0
-GLOBAL_DD    = 20.0
+DAY_LOSS_PCT = 15.0   # дневной лимит потерь (% от капитала)
+GLOBAL_DD    = 30.0   # максимальная просадка от пика (%)
 TRADE_INT    = 900     # анализ каждые 15 минут
 SL_CHECK_INT = 900     # 15 минут (проверка SL/TP)
 CMD_INT      = 3
@@ -1073,15 +1073,32 @@ def check_exits(pair, price, df4h):
     return False
 
 
+def _true_equity(s):
+    """
+    Реальный капитал = свободные деньги + маржа в открытой позиции.
+    Нужен чтобы circuit breaker не путал залог маржи с убытком.
+    """
+    equity = s.get("usdt", 10000)
+    pos    = s.get("pos")
+    if pos:
+        equity += pos.get("margin", 0)   # добавляем обратно заложенную маржу
+    return equity
+
+
 def circuit_breaker(sym):
     s     = BOT_STATES[sym]
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Сброс дневного счётчика в начале нового дня
     if s.get("day_date") != today:
         s["day_date"]  = today
-        s["day_start"] = s["usdt"]
+        s["day_start"] = _true_equity(s)   # истинный капитал, не s["usdt"]
         s["halted"]    = False
 
-    equity = s["usdt"]
+    # Истинный капитал: свободные средства + маржа в открытой позиции
+    equity = _true_equity(s)
+
+    # Проверка дневного лимита убытков (только по РЕАЛЬНЫМ потерям)
     if s["day_start"] > 0:
         dd = (s["day_start"] - equity) / s["day_start"] * 100
         if dd > DAY_LOSS_PCT and not s.get("halted"):
@@ -1090,10 +1107,11 @@ def circuit_breaker(sym):
             save_bot_state(sym, s)
             send(ADMIN_ID,
                  f"⛔ <b>CIRCUIT BREAKER — {sym}</b>\n"
-                 f"Дневной убыток: {dd:.1f}%\n"
+                 f"Дневной убыток: {dd:.1f}% (лимит {DAY_LOSS_PCT}%)\n"
                  f"Торговля приостановлена на 24ч")
             return True
 
+    # Проверка глобальной просадки от исторического пика
     peak = s.get("peak", equity)
     if peak > 0 and equity < peak:
         gdd = (peak - equity) / peak * 100
@@ -1103,14 +1121,15 @@ def circuit_breaker(sym):
             save_bot_state(sym, s)
             send(ADMIN_ID,
                  f"🚨 <b>ГЛОБАЛЬНАЯ ЗАЩИТА — {sym}</b>\n"
-                 f"Просадка от пика: {gdd:.1f}%\n"
+                 f"Просадка от пика: {gdd:.1f}% (лимит {GLOBAL_DD}%)\n"
                  f"Торговля остановлена на 3 дня!")
             return True
 
+    # Снятие блокировки после паузы
     if s.get("halted") and time.time() >= s.get("halt_until", 0):
         s["halted"]     = False
         s["halt_until"] = 0
-        s["day_start"]  = s["usdt"]
+        s["day_start"]  = _true_equity(s)
         save_bot_state(sym, s)
         send(ADMIN_ID, f"✅ Торговля возобновлена: {sym}")
 
