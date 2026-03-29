@@ -730,12 +730,22 @@ def active_positions():
 # ─── ИСПОЛНЕНИЕ СДЕЛОК ────────────────────────────────────────────────────────
 
 def do_open(pair, price, atr, side):
-    """Открыть позицию (LONG или SHORT)"""
+    """
+    Открыть позицию (LONG или SHORT).
+    Капитал берётся из демо-пула пользователей — деньги реально замораживаются
+    на их балансах пропорционально.
+    """
     s   = BOT_STATES[pair["symbol"]]
     sym = pair["symbol"]
     if s.get("pos") or active_positions() >= MAX_POS:
         return None
     if s.get("halted") and time.time() < s.get("halt_until", 0):
+        return None
+
+    # Используем общий пул пользователей как капитал
+    cap = pool_balance() if not LIVE_MODE else s["usdt"]
+    if cap < 10:   # минимум $10 в пуле
+        logger.warning("%s: пул пользователей пуст ($%.2f)", sym, cap)
         return None
 
     if side == "LONG":
@@ -748,18 +758,20 @@ def do_open(pair, price, atr, side):
     sl = round(sl, 2)
     tp = round(tp, 2)
 
-    # Размер позиции: риск 1.5% капитала
-    risk    = s["usdt"] * (RISK_PCT / 100)
+    # Размер позиции: риск RISK_PCT% от пула
+    risk    = cap * (RISK_PCT / 100)
     sl_dist = abs(price - sl)
     qty     = round(risk / max(sl_dist, 0.0001), 6)
     qty     = max(qty, pair["min_qty"])
 
-    # С учётом плеча
+    # С учётом плеча — не больше 30% пула на одну позицию
     position_value = qty * price
     margin_needed  = position_value / LEVERAGE
-    if margin_needed > s["usdt"] * 0.95:
-        qty = round(s["usdt"] * 0.95 * LEVERAGE / price, 6)
-        qty = max(qty, pair["min_qty"])
+    max_margin     = cap * 0.30
+    if margin_needed > max_margin:
+        qty           = round(max_margin * LEVERAGE / price, 6)
+        qty           = max(qty, pair["min_qty"])
+        margin_needed = qty * price / LEVERAGE
 
     # Реальный ордер на Bybit
     if LIVE_MODE:
@@ -773,9 +785,32 @@ def do_open(pair, price, atr, side):
     else:
         order_id = f"DEMO_{sym}_{int(time.time())}"
 
-    # Обновляем состояние (демо-режим вычитает маржу)
-    margin = qty * price / LEVERAGE
-    s["usdt"] -= margin
+    margin = round(qty * price / LEVERAGE, 4)
+
+    # Заморозить деньги у пользователей (берём из их балансов)
+    if not LIVE_MODE:
+        locks = pool_lock(pair["name"], margin)
+        # Уведомляем каждого пользователя о заморозке
+        if locks:
+            users_data = load_users()
+            for uid, user_margin in locks.items():
+                u = users_data.get(uid, {})
+                if u.get("notify", True):
+                    try:
+                        icon = "📈" if side == "LONG" else "📉"
+                        send(uid,
+                             f"🔒 <b>Бот открыл {side} {pair['emoji']} {pair['name']}</b>\n"
+                             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                             f"Вход: <b>${fmt(price)}</b> | {icon} {side}\n"
+                             f"Заморожено с вашего баланса: <b>${fmt(user_margin)}</b>\n"
+                             f"Доступный баланс: <b>${fmt(u['demo'].get('balance', 0))}</b>\n"
+                             f"SL: ${fmt(sl)} | TP: ${fmt(tp)}\n"
+                             f"🕐 {ts()}")
+                    except Exception:
+                        pass
+
+    # Обновляем состояние бота
+    s["usdt"] = max(s.get("usdt", 10000) - margin, 0)
     s["n"]    += 1
     s["pos"]   = {
         "side": side, "entry": price, "qty": qty,
@@ -786,7 +821,7 @@ def do_open(pair, price, atr, side):
     }
     save_bot_state(sym, s)
     t = {**s["pos"], "pair": pair["name"], "action": "OPEN",
-         "equity": round(s["usdt"] + margin, 2)}
+         "equity": round(cap, 2)}
     log_trade(t)
     return t
 
@@ -859,8 +894,8 @@ def do_close(pair, price, reason="SIGNAL"):
     s["pos"] = None
     save_bot_state(sym, s)
     log_trade(t)
-    distribute(pair["name"], pnl, pnl >= 0)
-    distribute_demo(pair["name"], pnl, pnl >= 0)
+    distribute(pair["name"], pnl, pnl >= 0)          # для реальных инвесторов
+    pool_release(pair["name"], pnl, pnl >= 0)         # вернуть деньги демо-пула
     return t
 
 
@@ -1017,6 +1052,7 @@ def get_user(cid):
             "id": uid, "name": "", "joined": ts(),
             "demo": {
                 "balance": 1000.0, "start": 1000.0, "peak": 1000.0,
+                "locked": 0.0,
                 "profit": 0.0, "trades": 0, "wins": 0, "loss": 0,
                 "history": [], "streak_win": 0, "streak_loss": 0, "max_dd": 0.0,
             },
@@ -1093,32 +1129,95 @@ def distribute(pair_name, pnl, is_win):
     save_users(users)
 
 
-def distribute_demo(pair_name, pnl, is_win):
-    """Распределить P&L бота по демо-балансам всех пользователей пропорционально"""
-    users     = load_users()
-    total_bal = sum(u["demo"]["balance"] for u in users.values() if u["demo"]["balance"] > 0)
-    if total_bal <= 0 or pnl == 0:
-        return
+# ─── ПУЛ ПОЛЬЗОВАТЕЛЕЙ — управление капиталом ─────────────────────────────────
+
+def pool_balance():
+    """Суммарный доступный демо-баланс всех пользователей (не включая locked)"""
+    users = load_users()
+    return sum(u["demo"].get("balance", 0) for u in users.values())
+
+
+def pool_total():
+    """Полный капитал пула: balance + locked (для оценки доли каждого)"""
+    users = load_users()
+    return sum(
+        u["demo"].get("balance", 0) + u["demo"].get("locked", 0)
+        for u in users.values()
+    )
+
+
+def pool_lock(pair_name, margin):
+    """
+    Заморозить margin из демо-балансов всех пользователей пропорционально.
+    Вычитает из d['balance'] и добавляет в d['locked'].
+    Возвращает {uid: locked_amount}.
+    """
+    users = load_users()
+    total = sum(u["demo"].get("balance", 0) for u in users.values())
+    if total <= 0:
+        return {}
+    locks = {}
     for uid, u in users.items():
         d = u["demo"]
-        if d["balance"] <= 0:
+        bal = d.get("balance", 0)
+        if bal <= 0:
             continue
-        share    = d["balance"] / total_bal
-        user_pnl = round(pnl * share, 4)
+        share        = bal / total
+        user_margin  = round(margin * share, 4)
+        d["balance"] = round(bal - user_margin, 4)
+        d["locked"]  = round(d.get("locked", 0) + user_margin, 4)
+        locks[uid]   = user_margin
+        u["demo"]    = d
+        users[uid]   = u
+    save_users(users)
+    return locks
+
+
+def pool_release(pair_name, pnl, is_win):
+    """
+    Разморозить locked средства + P&L каждому пользователю пропорционально.
+    Пропорция считается по locked (сколько кто внёс в эту сделку).
+    """
+    users        = load_users()
+    total_locked = sum(u["demo"].get("locked", 0) for u in users.values())
+    if total_locked <= 0:
+        return
+    for uid, u in users.items():
+        d           = u["demo"]
+        user_locked = d.get("locked", 0)
+        if user_locked <= 0:
+            continue
+        share        = user_locked / total_locked
+        user_pnl     = round(pnl * share, 4)
+        returned     = round(user_locked + user_pnl, 4)
+        d["balance"] = round(d.get("balance", 0) + returned, 4)
+        d["locked"]  = 0.0
         d["profit"]  = round(d.get("profit", 0) + user_pnl, 4)
-        d["balance"] = round(d["balance"] + user_pnl, 4)
-        if d["balance"] > d.get("peak", d["balance"]):
-            d["peak"] = d["balance"]
-        d["trades"] = d.get("trades", 0) + 1
+        d["trades"]  = d.get("trades", 0) + 1
         if is_win:
             d["wins"] = d.get("wins", 0) + 1
         else:
             d["loss"] = d.get("loss", 0) + 1
+        if d["balance"] > d.get("peak", 0):
+            d["peak"] = d["balance"]
         hist = d.get("history", [])
         hist.append({"pair": pair_name, "pnl": user_pnl, "time": ts()})
         d["history"] = hist[-30:]
-        u["demo"] = d
-        users[uid] = u
+        u["demo"]    = d
+        users[uid]   = u
+        # Личное уведомление пользователю о результате
+        if u.get("notify", True):
+            icon = "✅" if is_win else "❌"
+            sign_str = "+" if user_pnl >= 0 else ""
+            try:
+                send(uid,
+                     f"{icon} <b>Сделка закрыта: {pair_name}</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                     f"Ваш результат: <code>{sign_str}${fmt(abs(user_pnl))}</code>\n"
+                     f"Возвращено на баланс: <b>${fmt(returned)}</b>\n"
+                     f"Доступный баланс: <b>${fmt(d['balance'])}</b>")
+            except Exception:
+                pass
     save_users(users)
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
@@ -1467,37 +1566,55 @@ def screen_history(cid):
 # ─── ДЕМО-ТОРГОВЛЯ — ЭКРАНЫ ───────────────────────────────────────────────────
 
 def screen_demo_trade(cid):
-    """Главный экран демо-торговли"""
-    user  = get_user(cid)
-    d     = user["demo"]
-    poss  = demo_get_positions(user)
-    pct   = pct_val(d["balance"] - d["start"], d["start"])
-    wr    = wr_calc(d["wins"], d["loss"])
+    """Главный экран демо-торговли с пул-капиталом"""
+    user   = get_user(cid)
+    d      = user["demo"]
+    locked = d.get("locked", 0)
+    avail  = d.get("balance", 0)
+    total  = avail + locked
+    profit = d.get("profit", 0)
+    pct    = pct_val(profit, d.get("start", 1000))
+    wr     = wr_calc(d["wins"], d["loss"])
 
-    text  = (
-        "🎮 <b>Демо-трейдинг</b>\n"
+    # Подсчитать плавающий P&L бота (долю пользователя)
+    total_locked_pool = sum(
+        u["demo"].get("locked", 0) for u in load_users().values()
+    )
+    user_float = 0.0
+    if locked > 0 and total_locked_pool > 0:
+        user_share = locked / total_locked_pool
+        for pair in PAIRS:
+            s   = BOT_STATES.get(pair["symbol"], {})
+            pos = s.get("pos")
+            if pos:
+                price = fetch_price(pair["symbol"])
+                if price:
+                    side = pos["side"]
+                    fl   = (price - pos["entry"]) * pos["qty"] * LEVERAGE
+                    if side == "SHORT":
+                        fl = -fl
+                    user_float += fl * user_share
+
+    user_float = round(user_float, 4)
+
+    text = (
+        "🤖 <b>Бот управляет вашими деньгами</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💳 Баланс:   <b>${fmt(d['balance'])}</b>\n"
-        f"📈 Доход:    <code>{sign(pct)}{pct:.1f}%</code>\n"
-        f"📌 Позиций:  {len(poss)}/3\n"
-        f"📊 Сделок:   {d['trades']}  |  WR: {wr}%\n\n"
-        "🔹 Плечо: 2x  |  Без API ключей\n"
-        "🔹 Реальные цены: Bybit / OKX / CoinGecko\n\n"
+        f"💰 Доступно:       <b>${fmt(avail)}</b>\n"
+    )
+    if locked > 0:
+        fl_str = f"<code>{sign(user_float)}${fmt(abs(user_float))}</code>"
+        text += (
+            f"🔒 В торговле:     <b>${fmt(locked)}</b>\n"
+            f"📊 Float P&L:      {fl_str}\n"
+        )
+    text += (
+        f"💼 Итого капитал:  <b>${fmt(total)}</b>\n"
+        f"📈 Всего прибыль:  <code>{sign(pct)}{pct:.1f}%</code>\n"
+        f"📊 Сделок:  {d['trades']}  |  WR: {wr}%\n\n"
     )
 
-    if poss:
-        text += "📌 <b>Мои позиции:</b>\n"
-        for p in poss:
-            fl = demo_float_pnl(p)
-            fl_str = f"<code>{sign(fl)}${fmt(abs(fl))}</code>" if fl is not None else "<i>загрузка...</i>"
-            direction = "📈" if p["side"] == "LONG" else "📉"
-            text += (
-                f"  {direction} {p['emoji']} <b>{p['short']}</b> {p['side']}"
-                f" × {p['lev']}x | "
-                f"Вход: ${fmt(p['entry'])} | P&L: {fl_str}\n"
-            )
-
-    # Позиции самого бота
+    # Позиции бота с долей пользователя
     bot_pos_text = ""
     for pair in PAIRS:
         s   = BOT_STATES.get(pair["symbol"], {})
@@ -1510,13 +1627,35 @@ def screen_demo_trade(cid):
                 if side == "SHORT":
                     fl = -fl
                 direction = "📈" if side == "LONG" else "📉"
+                # Доля пользователя в этой позиции
+                u_share = (locked / total_locked_pool) if total_locked_pool > 0 and locked > 0 else 0
+                u_fl    = round(fl * u_share, 4)
                 bot_pos_text += (
-                    f"  {direction} {pair['emoji']} <b>{pair['name']}</b> {side}"
-                    f" ×{LEVERAGE}x | Вход: ${fmt(pos['entry'])} | "
-                    f"Float: <code>{sign(fl)}${fmt(abs(fl))}</code>\n"
+                    f"  {direction} {pair['emoji']} <b>{pair['name']}</b> {side} ×{LEVERAGE}x\n"
+                    f"     Вход: ${fmt(pos['entry'])} → Цена: ${fmt(price)}\n"
+                    f"     Ваш Float: <code>{sign(u_fl)}${fmt(abs(u_fl))}</code> "
+                    f"| Заморожено вашего: <b>${fmt(round(locked, 2))}</b>\n"
                 )
+
     if bot_pos_text:
-        text += f"\n🤖 <b>Позиции бота (автоматические):</b>\n{bot_pos_text}"
+        text += f"🤖 <b>Активные позиции бота:</b>\n{bot_pos_text}\n"
+    elif locked > 0:
+        text += "🔄 Бот анализирует рынок...\n"
+    else:
+        text += "💤 Бот ждёт сигнала для входа\n"
+
+    # Пользовательские позиции (ручные)
+    poss = demo_get_positions(user)
+    if poss:
+        text += "\n📌 <b>Мои ручные позиции:</b>\n"
+        for p in poss:
+            fl     = demo_float_pnl(p)
+            fl_str = f"<code>{sign(fl)}${fmt(abs(fl))}</code>" if fl is not None else "<i>загрузка...</i>"
+            direction = "📈" if p["side"] == "LONG" else "📉"
+            text += (
+                f"  {direction} {p['emoji']} <b>{p['short']}</b> {p['side']}"
+                f" × {p['lev']}x | Вход: ${fmt(p['entry'])} | P&L: {fl_str}\n"
+            )
 
     send(cid, text, kb_demo_trade(poss))
 
