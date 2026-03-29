@@ -1282,12 +1282,22 @@ def distribute(pair_name, pnl, is_win):
             r["deposited"] += user_pnl
         r["trades"] += 1
         if is_win:
-            r["wins"] += 1
+            r["wins"]          += 1
+            r["streak_win"]    = r.get("streak_win", 0) + 1
+            r["streak_loss"]   = 0
         else:
-            r["loss"] += 1
+            r["loss"]          += 1
+            r["streak_loss"]   = r.get("streak_loss", 0) + 1
+            r["streak_win"]    = 0
         r["history"].append({"pair": pair_name, "pnl": user_pnl, "time": ts()})
+        r["history"] = r["history"][-30:]   # ограничение истории
         if r["balance"] > r.get("peak", 0):
             r["peak"] = r["balance"]
+        # Максимальная просадка реального счёта
+        if r.get("deposited", 0) > 0:
+            dd_r = (r["deposited"] - r["balance"]) / r["deposited"] * 100
+            if dd_r > r.get("max_dd", 0):
+                r["max_dd"] = round(dd_r, 2)
         u["real"] = r
         users[uid] = u
         if u.get("notify") and user_pnl != 0:
@@ -1399,14 +1409,44 @@ def pool_release(pair_name, pnl, is_win):
         d["profit"]  = round(d.get("profit", 0) + user_pnl, 4)
         d["trades"]  = d.get("trades", 0) + 1
         if is_win:
-            d["wins"] = d.get("wins", 0) + 1
+            d["wins"]          = d.get("wins", 0) + 1
+            d["streak_win"]    = d.get("streak_win", 0) + 1
+            d["streak_loss"]   = 0
         else:
-            d["loss"] = d.get("loss", 0) + 1
+            d["loss"]          = d.get("loss", 0) + 1
+            d["streak_loss"]   = d.get("streak_loss", 0) + 1
+            d["streak_win"]    = 0
+        prev_balance = returned - user_pnl   # баланс до этой сделки ≈ pair_locked
         if d["balance"] > d.get("peak", 0):
             d["peak"] = d["balance"]
+        # Максимальная просадка демо-счёта
+        start_bal = d.get("start", 1000)
+        if start_bal > 0 and d["balance"] < start_bal:
+            dd_demo = (start_bal - d["balance"]) / start_bal * 100
+            if dd_demo > d.get("max_dd", 0):
+                d["max_dd"] = round(dd_demo, 2)
         hist = d.get("history", [])
         hist.append({"pair": pair_name, "pnl": user_pnl, "time": ts()})
         d["history"] = hist[-30:]
+
+        # Проверяем достижения (только при росте баланса)
+        MILESTONES = [1100, 1250, 1500, 2000, 3000, 5000]
+        if user_pnl > 0:
+            for ms in MILESTONES:
+                # Баланс ПЕРЕСЁК milestone снизу вверх
+                if (returned - user_pnl) < ms <= d["balance"]:
+                    try:
+                        send(uid,
+                             f"🏆 <b>Достижение!</b>\n"
+                             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                             f"Ваш демо-баланс достиг <b>${ms:,}</b>! 🎉\n"
+                             f"Текущий баланс: <b>${fmt(d['balance'])}</b>\n"
+                             f"Прирост от старта: +${fmt(d['balance'] - d.get('start', 1000))}\n\n"
+                             f"Готовы перейти на реальный счёт? 💰")
+                    except Exception:
+                        pass
+                    break
+
         u["demo"]    = d
         users[uid]   = u
 
@@ -1582,10 +1622,11 @@ def kb_admin():
         [{"text": "👥 Пользователи", "callback_data": "adm_users"},
          {"text": "📊 Статистика",   "callback_data": "adm_stats"}],
         [{"text": "💰 Депозиты",     "callback_data": "adm_deposits"},
-         {"text": "💸 Выводы",      "callback_data": "adm_withdrawals"}],
+         {"text": "💸 Выводы",       "callback_data": "adm_withdrawals"}],
         [{"text": "📢 Рассылка",     "callback_data": "adm_broadcast"},
-         {"text": "📋 Все сделки",  "callback_data": "adm_trades"}],
-        [{"text": "🏠 Главное меню","callback_data": "menu"}],
+         {"text": "📋 Все сделки",   "callback_data": "adm_trades"}],
+        [{"text": "🔄 Сброс CB",     "callback_data": "adm_reset_cb"}],
+        [{"text": "🏠 Главное меню", "callback_data": "menu"}],
     ]
 
 # ─── ЭКРАНЫ ───────────────────────────────────────────────────────────────────
@@ -2393,12 +2434,22 @@ def process_update(update):
                          f"🎉 <b>По вашей ссылке зарегистрировался новый пользователь!</b>\n"
                          f"Вы получите 5% от его прибыли автоматически.")
 
-            if not user.get("welcomed"):
+            # Считаем пользователя "новым" если у него нет ни одной сделки
+            # и welcome ещё не был показан — это защищает существующих пользователей
+            has_history = (
+                user.get("demo", {}).get("trades", 0) > 0 or
+                user.get("real", {}).get("trades", 0) > 0 or
+                abs(user.get("demo", {}).get("balance", 1000) - 1000) > 0.01
+            )
+            if not user.get("welcomed") and not has_history:
                 # Новый пользователь — показываем приветственный экран один раз
                 user["welcomed"] = True
                 save_user(cid, user)
                 screen_welcome(cid, name=name)
             else:
+                if not user.get("welcomed"):
+                    user["welcomed"] = True   # молча ставим флаг для старых аккаунтов
+                    save_user(cid, user)
                 screen_main(cid)
         elif text == "/stats":
             screen_stats(cid)
@@ -2711,6 +2762,27 @@ def handle_admin_cb(cid, data):
     elif data == "adm_broadcast":
         PENDING_INPUTS[cid] = "broadcast"
         send(cid, "✏️ Введите текст рассылки:", kb_back())
+    elif data == "adm_reset_cb":
+        if not is_admin(cid):
+            return
+        reset_lines = []
+        for pair in PAIRS:
+            s = BOT_STATES.get(pair["symbol"], {})
+            if s.get("halted"):
+                s["halted"]      = False
+                s["halt_until"]  = 0
+                s["day_start"]   = _true_equity(s)
+                BOT_STATES[pair["symbol"]] = s
+                save_bot_state(pair["symbol"], s)
+                reset_lines.append(f"  ✅ {pair['name']}: circuit-breaker снят")
+            else:
+                reset_lines.append(f"  ℹ️ {pair['name']}: не был остановлен")
+        result_text = "\n".join(reset_lines) if reset_lines else "Нет остановленных пар"
+        send(cid,
+             f"🔄 <b>Сброс Circuit Breaker</b>\n"
+             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+             f"{result_text}",
+             kb_admin())
 
 # ─── ГЛАВНЫЙ ТОРГОВЫЙ ЦИКЛ ────────────────────────────────────────────────────
 
@@ -2728,10 +2800,11 @@ def trading_loop():
     for pair in PAIRS:
         BOT_STATES[pair["symbol"]] = load_bot_state(pair["symbol"])
 
-    last_trade    = 0
-    last_report   = 0
-    last_sl_check = 0
-    check_num     = 0
+    last_trade       = 0
+    last_report      = 0
+    last_daily_users = 0   # ежедневный личный отчёт пользователям
+    last_sl_check    = 0
+    check_num        = 0
 
     while True:
         try:
@@ -2880,6 +2953,38 @@ def trading_loop():
                      f"P&L: <code>{sign(pnl_w)}${fmt(abs(pnl_w))}</code>\n"
                      f"Капитал бота: ${fmt(total_eq)}\n"
                      f"🕐 {ts()}")
+
+            # Ежедневный личный отчёт каждому пользователю (раз в 24 часа)
+            if now - last_daily_users >= 86400:
+                last_daily_users = now
+                all_u      = load_users()
+                active_pos = active_positions()
+                for uid, u in all_u.items():
+                    if not u.get("notify", True):
+                        continue
+                    d = u.get("demo", {})
+                    bal    = d.get("balance", 0) + d.get("locked", 0)
+                    start  = d.get("start", 1000)
+                    profit = d.get("profit", 0)
+                    trades = d.get("trades", 0)
+                    wins   = d.get("wins", 0)
+                    wr     = wr_calc(wins, trades - wins)
+                    pct    = pct_val(bal - start, start)
+                    trend  = "📈" if profit >= 0 else "📉"
+                    try:
+                        send(uid,
+                             f"📅 <b>Ваш ежедневный отчёт</b>\n"
+                             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                             f"💰 Демо-баланс:  <b>${fmt(bal)}</b>  "
+                             f"({sign(pct)}{pct:.1f}%)\n"
+                             f"📊 Сделок всего: <b>{trades}</b> | "
+                             f"WR: <b>{wr}%</b>\n"
+                             f"💹 Суммарный P&L: <code>{sign(profit)}${fmt(abs(profit))}</code>\n"
+                             f"📌 Открытых позиций: <b>{active_pos}/{MAX_POS}</b>\n\n"
+                             f"{trend} Бот работает 24/7. Следующие сделки уже на подходе.\n"
+                             f"🕐 {ts()}")
+                    except Exception:
+                        pass
 
         except KeyboardInterrupt:
             logger.info("Остановка торгового цикла...")
