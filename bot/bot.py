@@ -22,9 +22,10 @@ CryptoBot Pro v5 — Автоматическая торговля (Demo + Live)
   + 1D тренд как бонус-фильтр (не обязателен)
 
 ВЫХОД:
-  🎯 Тейк-профит: ATR × 2.5 (R:R = 1:1.7)
+  🎯 Тейк-профит: ATR × 1.5 (R:R = 1:1, быстрые выходы)
   ⛔ Стоп-лосс:   ATR × 1.5
-  📈 Трейлинг-стоп активируется при 50% пути к TP
+  🔐 Breakeven:   при 50% пути к TP — SL → безубыток
+  📈 Трейлинг-стоп работает параллельно
 
 РИСК-МЕНЕДЖМЕНТ:
   • 2% капитала на сделку
@@ -105,8 +106,10 @@ RSI_SHORT_MIN= 28
 RSI_SHORT_MAX= 62
 ATR_PERIOD   = 14
 ATR_SL_MULT  = 1.5
-ATR_TP_MULT  = 2.5    # мягче: быстрее TP
+ATR_TP_MULT  = 1.5    # 1.5x ATR — быстрый выход, R:R=1:1, сделки закрываются ~в 2x быстрее
 ATR_TRAIL    = 1.0
+BE_TRIGGER   = 0.50   # breakeven: при 50% пути к TP → SL в безубыток
+BE_BUFFER    = 0.15   # небольшой буфер выше/ниже входа (в ATR) при переводе в безубыток
 ST_MULT      = 3.0
 ST_PERIOD    = 10
 MACD_FAST    = 12
@@ -938,14 +941,59 @@ def do_open(pair, price, atr, side):
 
 
 def update_trailing(pair, price):
-    """Обновить трейлинг-стоп"""
+    """
+    Обновить трейлинг-стоп и проверить breakeven.
+
+    Breakeven-логика:
+    ─────────────────
+    Когда цена прошла >= BE_TRIGGER (50%) пути от входа до TP,
+    SL автоматически двигается в безубыток + маленький буфер (BE_BUFFER × ATR).
+    После этого даже если цена развернётся — позиция закроется в небольшой плюс,
+    а не в убыток. Бот дальше спокойно ждёт TP без риска.
+
+    Breakeven не откатывается назад (флаг "be_done").
+    Трейлинг-стоп продолжает работать только если SL уже выше (LONG) / ниже (SHORT)
+    безубытка.
+    """
     s   = BOT_STATES[pair["symbol"]]
     pos = s.get("pos")
     if not pos:
         return
-    atr  = pos["atr"]
-    side = pos["side"]
+    atr   = pos["atr"]
+    side  = pos["side"]
+    entry = pos["entry"]
+    tp    = pos["tp"]
 
+    # ── Breakeven ──────────────────────────────────────────────────────────────
+    if not pos.get("be_done", False):
+        tp_dist   = abs(tp - entry)
+        moved     = abs(price - entry)
+        if tp_dist > 0 and moved >= BE_TRIGGER * tp_dist:
+            # Двигаем SL в безубыток + маленький буфер
+            if side == "LONG":
+                be_sl = round(entry + BE_BUFFER * atr, 2)
+                if be_sl > pos["sl"]:          # только если улучшаем SL
+                    pos["sl"]     = be_sl
+                    pos["trail_sl"] = be_sl
+            else:
+                be_sl = round(entry - BE_BUFFER * atr, 2)
+                if be_sl < pos["sl"]:          # только если улучшаем SL
+                    pos["sl"]     = be_sl
+                    pos["trail_sl"] = be_sl
+            pos["be_done"] = True
+            # Уведомляем всех пользователей (важное событие — безубыток)
+            notify_all_users(
+                f"🔐 <b>Безубыток | {pair['emoji']} {pair['name']} {side}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"SL переведён в безубыток (+{fmt(BE_BUFFER * atr)}$)\n"
+                f"Новый SL: ${fmt(pos['sl'])} | TP: ${fmt(tp)}\n"
+                f"Позиция уже не может закрыться в убыток.\n"
+                f"🕐 {ts()}",
+                critical=True
+            )
+            logger.info("%s %s: breakeven SL → $%.2f", pair["name"], side, pos["sl"])
+
+    # ── Трейлинг-стоп ─────────────────────────────────────────────────────────
     if side == "LONG":
         new_sl = round(price - ATR_TRAIL * atr, 2)
         if new_sl > pos.get("trail_sl", pos["sl"]) and new_sl > pos["sl"]:
@@ -1839,7 +1887,8 @@ def screen_strategy(cid):
         "  → Нужно 3 из 4 + дневной тренд вниз\n\n"
         "⚙️ <b>Защита капитала:</b>\n"
         f"  • Риск: {RISK_PCT}% на сделку | Плечо: {LEVERAGE}x\n"
-        f"  • Стоп-лосс: ATR×{ATR_SL_MULT} | Тейк-профит: ATR×{ATR_TP_MULT}\n"
+        f"  • Стоп-лосс: ATR×{ATR_SL_MULT} | Тейк-профит: ATR×{ATR_TP_MULT} (R:R 1:1)\n"
+        f"  • 🔐 Breakeven при 50% пути к TP — SL → безубыток\n"
         "  • Трейлинг-стоп — стоп двигается за ценой\n"
         f"  • Circuit-breaker: стоп при -{DAY_LOSS_PCT}% в день\n\n"
         "📊 <b>Сигналы прямо сейчас:</b>"
