@@ -76,6 +76,17 @@ PAIRS = [
     {"symbol": "SOLUSDT", "name": "SOL", "emoji": "◎",  "min_qty": 0.1},
 ]
 
+# ─── МОНЕТЫ ДЛЯ ДЕМО-ТОРГОВЛИ ─────────────────────────────────────────────────
+DEMO_COINS = [
+    {"symbol": "BTCUSDT",  "name": "Bitcoin",  "short": "BTC",  "emoji": "₿",  "cg_id": "bitcoin"},
+    {"symbol": "ETHUSDT",  "name": "Ethereum", "short": "ETH",  "emoji": "Ξ",  "cg_id": "ethereum"},
+    {"symbol": "SOLUSDT",  "name": "Solana",   "short": "SOL",  "emoji": "◎",  "cg_id": "solana"},
+    {"symbol": "BNBUSDT",  "name": "BNB",      "short": "BNB",  "emoji": "🔶", "cg_id": "binancecoin"},
+    {"symbol": "XRPUSDT",  "name": "Ripple",   "short": "XRP",  "emoji": "💧", "cg_id": "ripple"},
+    {"symbol": "ADAUSDT",  "name": "Cardano",  "short": "ADA",  "emoji": "🔵", "cg_id": "cardano"},
+]
+DEMO_LEVERAGE = 2  # фиксированное плечо для демо-счёта
+
 # ─── ПАРАМЕТРЫ СТРАТЕГИИ ──────────────────────────────────────────────────────
 EMA_MID      = 21
 EMA_SLOW     = 50
@@ -146,6 +157,225 @@ def fetch_price(symbol):
     except Exception as e:
         logger.error("fetch_price %s: %s", symbol, e)
     return None
+
+
+# ─── МУЛЬТИ-ИСТОЧНИК ЦЕН (без API ключей) ─────────────────────────────────────
+
+def fetch_price_bybit_spot(symbol):
+    """Цена через Bybit spot (публичный, без авторизации)"""
+    try:
+        r = requests.get(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "spot", "symbol": symbol},
+            timeout=8,
+        )
+        lst = r.json().get("result", {}).get("list", [])
+        if lst:
+            return float(lst[0]["lastPrice"])
+    except Exception:
+        pass
+    return None
+
+
+def fetch_price_okx(symbol):
+    """Цена через OKX (публичный API, без ключей)"""
+    # symbol: BTCUSDT → BTC-USDT
+    inst = symbol.replace("USDT", "-USDT")
+    try:
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/ticker",
+            params={"instId": inst},
+            timeout=8,
+        )
+        data = r.json().get("data", [])
+        if data:
+            return float(data[0]["last"])
+    except Exception:
+        pass
+    return None
+
+
+def fetch_price_coingecko(cg_id):
+    """Цена через CoinGecko (публичный API, без ключей)"""
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": cg_id, "vs_currencies": "usd"},
+            timeout=10,
+        )
+        return float(r.json()[cg_id]["usd"])
+    except Exception:
+        pass
+    return None
+
+
+def fetch_demo_price(symbol, cg_id=None):
+    """
+    Получить цену монеты из нескольких источников:
+    1. Bybit spot (публичный, без ключей)
+    2. OKX (публичный)
+    3. CoinGecko (публичный)
+    Возвращает (цена, источник) или (None, None)
+    """
+    p = fetch_price_bybit_spot(symbol)
+    if p:
+        return p, "Bybit"
+    p = fetch_price_okx(symbol)
+    if p:
+        return p, "OKX"
+    if cg_id:
+        p = fetch_price_coingecko(cg_id)
+        if p:
+            return p, "CoinGecko"
+    return None, None
+
+
+def demo_coin_by_symbol(symbol):
+    """Найти монету в DEMO_COINS по символу"""
+    for c in DEMO_COINS:
+        if c["symbol"] == symbol:
+            return c
+    return None
+
+
+# ─── ДЕМО ПОЗИЦИИ — ЛОГИКА ────────────────────────────────────────────────────
+
+def demo_get_positions(user):
+    """Получить список открытых демо-позиций (миграция старых юзеров)"""
+    d = user["demo"]
+    if "positions" not in d:
+        d["positions"] = []
+    return d["positions"]
+
+
+def demo_open_pos(user, symbol, side, usdt_amount):
+    """
+    Открыть демо-позицию.
+    usdt_amount — сумма в USDT без плеча (из баланса).
+    Возвращает (True, сообщение) или (False, причина_ошибки).
+    """
+    d    = user["demo"]
+    poss = demo_get_positions(user)
+
+    # Уже есть позиция по этой паре?
+    if any(p["symbol"] == symbol for p in poss):
+        return False, "По этой монете уже открыта позиция. Сначала закройте её."
+
+    # Максимум 3 позиции
+    if len(poss) >= 3:
+        return False, "Максимум 3 открытых позиции одновременно."
+
+    # Минимум $5
+    if usdt_amount < 5:
+        return False, "Минимальная сумма сделки: $5."
+
+    # Баланс достаточен?
+    if usdt_amount > d["balance"]:
+        return False, f"Недостаточно баланса. Доступно: ${fmt(d['balance'])}"
+
+    coin = demo_coin_by_symbol(symbol)
+    if not coin:
+        return False, "Монета не найдена."
+
+    price, source = fetch_demo_price(symbol, coin.get("cg_id"))
+    if not price:
+        return False, "Не удалось получить цену. Попробуйте позже."
+
+    qty = round(usdt_amount / price, 6)
+
+    pos = {
+        "symbol":  symbol,
+        "name":    coin["name"],
+        "short":   coin["short"],
+        "emoji":   coin["emoji"],
+        "side":    side,        # "LONG" или "SHORT"
+        "entry":   price,
+        "qty":     qty,
+        "usdt":    usdt_amount,
+        "lev":     DEMO_LEVERAGE,
+        "source":  source,
+        "ts":      ts(),
+    }
+    poss.append(pos)
+    d["balance"] = round(d["balance"] - usdt_amount, 4)
+    return True, pos
+
+
+def demo_close_pos(user, symbol):
+    """
+    Закрыть демо-позицию по символу.
+    Возвращает (True, pnl, exit_price) или (False, причина).
+    """
+    d    = user["demo"]
+    poss = demo_get_positions(user)
+    pos  = next((p for p in poss if p["symbol"] == symbol), None)
+    if not pos:
+        return False, "Позиция не найдена.", None
+
+    coin = demo_coin_by_symbol(symbol)
+    exit_price, _ = fetch_demo_price(symbol, coin.get("cg_id") if coin else None)
+    if not exit_price:
+        return False, "Не удалось получить цену закрытия.", None
+
+    entry  = pos["entry"]
+    qty    = pos["qty"]
+    lev    = pos.get("lev", DEMO_LEVERAGE)
+    usdt   = pos["usdt"]
+    side   = pos["side"]
+
+    # P&L с учётом плеча
+    if side == "LONG":
+        pnl = (exit_price - entry) / entry * usdt * lev
+    else:
+        pnl = (entry - exit_price) / entry * usdt * lev
+
+    pnl = round(pnl, 4)
+
+    # Возвращаем вложенные + P&L
+    d["balance"] = round(d["balance"] + usdt + pnl, 4)
+    if d["balance"] > d.get("peak", d["balance"]):
+        d["peak"] = d["balance"]
+
+    d["trades"] += 1
+    if pnl >= 0:
+        d["wins"]          += 1
+        d["streak_win"]    = d.get("streak_win", 0) + 1
+        d["streak_loss"]   = 0
+    else:
+        d["loss"]          += 1
+        d["streak_loss"]   = d.get("streak_loss", 0) + 1
+        d["streak_win"]    = 0
+
+    d["profit"] = round(d.get("profit", 0) + pnl, 4)
+
+    # Сохраняем в историю (последние 30)
+    hist = d.get("history", [])
+    hist.append({
+        "symbol": symbol, "side": side,
+        "entry":  entry,  "exit": exit_price,
+        "usdt":   usdt,   "lev":  lev,
+        "pnl":    pnl,    "ts":   ts(),
+    })
+    d["history"] = hist[-30:]
+
+    # Убираем из открытых позиций
+    d["positions"] = [p for p in poss if p["symbol"] != symbol]
+    return True, pnl, exit_price
+
+
+def demo_float_pnl(pos):
+    """Плавающий P&L позиции (без закрытия)"""
+    coin = demo_coin_by_symbol(pos["symbol"])
+    price, _ = fetch_demo_price(pos["symbol"], coin.get("cg_id") if coin else None)
+    if not price:
+        return None
+    entry = pos["entry"]
+    usdt  = pos["usdt"]
+    lev   = pos.get("lev", DEMO_LEVERAGE)
+    if pos["side"] == "LONG":
+        return round((price - entry) / entry * usdt * lev, 4)
+    else:
+        return round((entry - price) / entry * usdt * lev, 4)
 
 # ─── BYBIT TRADING API (реальные ордера) ──────────────────────────────────────
 
@@ -874,24 +1104,82 @@ def answer_cb(cb_id, text=""):
 def kb_main():
     mode = "🟢 LIVE (Bybit)" if LIVE_MODE else "🎮 DEMO"
     return [
-        [{"text": "👤 Аккаунт",            "callback_data": "account"},
-         {"text": "📊 Статистика",         "callback_data": "stats"}],
-        [{"text": "🌐 Рынок",              "callback_data": "market"},
-         {"text": "📈 Сделки",             "callback_data": "history"}],
+        [{"text": "🎮 Демо-трейдинг",      "callback_data": "demo_trade"},
+         {"text": "👤 Аккаунт",            "callback_data": "account"}],
+        [{"text": "📊 Статистика",         "callback_data": "stats"},
+         {"text": "🌐 Рынок",              "callback_data": "market"}],
+        [{"text": "📈 Сделки",             "callback_data": "history"},
+         {"text": "❓ Стратегия",          "callback_data": "strategy"}],
         [{"text": "💰 Пополнить",          "callback_data": "deposit"},
          {"text": "💸 Вывести",           "callback_data": "withdraw"}],
         [{"text": "🤝 Реферальная",        "callback_data": "referral"},
-         {"text": "❓ Стратегия",          "callback_data": "strategy"}],
-        [{"text": "🔔 Уведомления",        "callback_data": "toggle_notify"},
          {"text": f"⚡ Режим: {mode}",     "callback_data": "mode_info"}],
     ]
 
 def kb_back():
     return [[{"text": "🏠 Главное меню", "callback_data": "menu"}]]
 
+
+def kb_demo_back():
+    return [[{"text": "◀️ Демо-торговля", "callback_data": "demo_trade"}]]
+
+
+def kb_demo_trade(positions):
+    """Клавиатура главного демо-экрана"""
+    rows = [
+        [{"text": "📊 Открыть Long/Short", "callback_data": "demo_open_menu"}],
+    ]
+    if positions:
+        rows.append([{"text": "📌 Мои позиции", "callback_data": "demo_positions"}])
+    rows.append([{"text": "📜 История сделок", "callback_data": "demo_history"}])
+    rows.append([{"text": "🔄 Сбросить баланс ($1000)", "callback_data": "demo_reset"}])
+    rows.append([{"text": "🏠 Главное меню", "callback_data": "menu"}])
+    return rows
+
+
+def kb_demo_coin_select(action):
+    """Клавиатура выбора монеты (action: long / short)"""
+    rows = []
+    row  = []
+    for i, c in enumerate(DEMO_COINS):
+        row.append({"text": f"{c['emoji']} {c['short']}", "callback_data": f"demo_{action}_{c['symbol']}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "◀️ Назад", "callback_data": "demo_trade"}])
+    return rows
+
+
+def kb_demo_amount(symbol, side):
+    """Клавиатура выбора суммы для демо-сделки"""
+    amounts = [10, 25, 50, 100, 200]
+    rows    = []
+    row     = []
+    for a in amounts:
+        row.append({"text": f"${a}", "callback_data": f"demo_exec_{side}_{symbol}_{a}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "◀️ Назад", "callback_data": f"demo_open_{side}"}])
+    return rows
+
+
+def kb_demo_positions(poss):
+    """Кнопки закрытия открытых позиций"""
+    rows = []
+    for p in poss:
+        rows.append([{"text": f"❌ Закрыть {p['emoji']} {p['short']} {p['side']}",
+                      "callback_data": f"demo_close_{p['symbol']}"}])
+    rows.append([{"text": "◀️ Демо-торговля", "callback_data": "demo_trade"}])
+    return rows
+
 def kb_account():
     return [
-        [{"text": "🎮 Демо-счёт",      "callback_data": "demo"},
+        [{"text": "🎮 Демо-трейдинг",  "callback_data": "demo_trade"},
          {"text": "💼 Реальный счёт",  "callback_data": "real"}],
         [{"text": "📊 Моя статистика", "callback_data": "my_stats"},
          {"text": "🏆 Лидерборд",      "callback_data": "leaderboard"}],
@@ -1121,6 +1409,155 @@ def screen_history(cid):
             f" | {t.get('time','')}\n\n"
         )
     send(cid, text, kb_back())
+
+
+# ─── ДЕМО-ТОРГОВЛЯ — ЭКРАНЫ ───────────────────────────────────────────────────
+
+def screen_demo_trade(cid):
+    """Главный экран демо-торговли"""
+    user  = get_user(cid)
+    d     = user["demo"]
+    poss  = demo_get_positions(user)
+    pct   = pct_val(d["balance"] - d["start"], d["start"])
+    wr    = wr_calc(d["wins"], d["loss"])
+
+    text  = (
+        "🎮 <b>Демо-трейдинг</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💳 Баланс:   <b>${fmt(d['balance'])}</b>\n"
+        f"📈 Доход:    <code>{sign(pct)}{pct:.1f}%</code>\n"
+        f"📌 Позиций:  {len(poss)}/3\n"
+        f"📊 Сделок:   {d['trades']}  |  WR: {wr}%\n\n"
+        "🔹 Плечо: 2x  |  Без API ключей\n"
+        "🔹 Реальные цены: Bybit / OKX / CoinGecko\n\n"
+    )
+
+    if poss:
+        text += "📌 <b>Открытые позиции:</b>\n"
+        for p in poss:
+            fl = demo_float_pnl(p)
+            fl_str = f"<code>{sign(fl)}${fmt(abs(fl))}</code>" if fl is not None else "<i>загрузка...</i>"
+            chg = ((fetch_demo_price(p["symbol"])[0] or p["entry"]) / p["entry"] - 1) * 100
+            direction = "📈" if p["side"] == "LONG" else "📉"
+            text += (
+                f"  {direction} {p['emoji']} <b>{p['short']}</b> {p['side']}"
+                f" × {p['lev']}x | "
+                f"Вход: ${fmt(p['entry'])} | P&L: {fl_str}\n"
+            )
+
+    send(cid, text, kb_demo_trade(poss))
+
+
+def screen_demo_open_menu(cid):
+    """Выбор направления: Long или Short"""
+    text = (
+        "📊 <b>Открыть позицию</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📈 <b>LONG</b> — ставишь на рост\n"
+        "   Зарабатываешь когда цена растёт\n\n"
+        "📉 <b>SHORT</b> — ставишь на падение\n"
+        "   Зарабатываешь когда цена падает\n\n"
+        "Плечо: <b>2x</b>  |  Выбери направление:"
+    )
+    kb = [
+        [{"text": "📈 LONG (рост)",    "callback_data": "demo_open_long"},
+         {"text": "📉 SHORT (падение)", "callback_data": "demo_open_short"}],
+        [{"text": "◀️ Назад", "callback_data": "demo_trade"}],
+    ]
+    send(cid, text, kb)
+
+
+def screen_demo_select_coin(cid, side):
+    """Выбор монеты для Long/Short"""
+    side_ru  = "LONG 📈" if side == "long" else "SHORT 📉"
+    text = (
+        f"📊 <b>Открыть {side_ru}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Выбери монету:"
+    )
+    send(cid, text, kb_demo_coin_select(side))
+
+
+def screen_demo_select_amount(cid, side, symbol):
+    """Выбор суммы в USDT для позиции"""
+    user  = get_user(cid)
+    d     = user["demo"]
+    coin  = demo_coin_by_symbol(symbol)
+    if not coin:
+        send(cid, "❌ Монета не найдена", kb_demo_back())
+        return
+
+    price, source = fetch_demo_price(symbol, coin.get("cg_id"))
+    price_str = f"${fmt(price)} <i>({source})</i>" if price else "<i>нет данных</i>"
+    side_ru   = "LONG 📈" if side == "long" else "SHORT 📉"
+
+    text = (
+        f"📊 <b>{coin['emoji']} {coin['name']} — {side_ru}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💲 Цена:    {price_str}\n"
+        f"💳 Баланс:  <b>${fmt(d['balance'])}</b>\n"
+        f"⚡ Плечо:   {DEMO_LEVERAGE}x\n\n"
+        "Выбери сумму сделки (из баланса):"
+    )
+    send(cid, text, kb_demo_amount(symbol, side))
+
+
+def screen_demo_positions(cid):
+    """Экран открытых позиций с P&L и кнопками закрытия"""
+    user  = get_user(cid)
+    poss  = demo_get_positions(user)
+
+    if not poss:
+        send(cid, "📌 Открытых позиций нет.\n\nОткрой первую сделку!", kb_demo_back())
+        return
+
+    send(cid, "⏳ Загружаю текущие цены...")
+
+    text = "📌 <b>Открытые позиции</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for p in poss:
+        fl    = demo_float_pnl(p)
+        coin  = demo_coin_by_symbol(p["symbol"])
+        cur_p, src = fetch_demo_price(p["symbol"], coin.get("cg_id") if coin else None)
+        cur_str = f"${fmt(cur_p)}" if cur_p else "?"
+        fl_str  = f"{sign(fl)}${fmt(abs(fl))}" if fl is not None else "?"
+        chg_pct = ((cur_p / p["entry"]) - 1) * 100 if cur_p else 0
+        direction = "📈" if p["side"] == "LONG" else "📉"
+        text += (
+            f"{direction} <b>{p['emoji']} {p['short']}</b> {p['side']} ×{p['lev']}x\n"
+            f"   Вход:   ${fmt(p['entry'])}\n"
+            f"   Сейчас: {cur_str}  ({sign(chg_pct)}{chg_pct:.2f}%)\n"
+            f"   Сумма:  ${fmt(p['usdt'])} → эффект. ${fmt(p['usdt']*p['lev'])}\n"
+            f"   P&L:    <b><code>{fl_str}</code></b>\n"
+            f"   Дата:   {p['ts']}\n\n"
+        )
+
+    send(cid, text, kb_demo_positions(poss))
+
+
+def screen_demo_history(cid):
+    """История последних 10 закрытых демо-сделок"""
+    user  = get_user(cid)
+    d     = user["demo"]
+    hist  = d.get("history", [])
+
+    if not hist:
+        send(cid, "📜 Историй сделок нет.\n\nОткрой и закрой первую сделку!", kb_demo_back())
+        return
+
+    total_pnl = sum(h["pnl"] for h in hist)
+    text = (
+        "📜 <b>История демо-сделок</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    for h in reversed(hist[-10:]):
+        ico  = "✅" if h["pnl"] >= 0 else "❌"
+        text += (
+            f"{ico} <b>{h['symbol'][:3]}</b> {h['side']}  "
+            f"<code>{sign(h['pnl'])}${fmt(abs(h['pnl']))}</code>\n"
+            f"   {fmt(h['entry'])} → {fmt(h['exit'])}  ×{h['lev']}x  {h['ts']}\n"
+        )
+    text += f"\n💹 Итого: <b><code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code></b>"
+    send(cid, text, kb_demo_back())
 
 
 def screen_account(cid):
@@ -1372,6 +1809,8 @@ def process_update(update):
             screen_stats(cid)
         elif text == "/market":
             screen_market(cid)
+        elif text == "/demo":
+            screen_demo_trade(cid)
         elif text == "/balance":
             screen_mode_info(cid)
         elif text == "/debug":
@@ -1453,16 +1892,97 @@ def process_update(update):
             screen_mode_info(cid)
         elif data == "leaderboard":
             screen_leaderboard(cid)
-        elif data == "demo":
+        # ── Демо-трейдинг ───────────────────────────────────────────────────────
+        elif data == "demo_trade":
+            screen_demo_trade(cid)
+
+        elif data == "demo_open_menu":
+            screen_demo_open_menu(cid)
+
+        elif data == "demo_open_long":
+            screen_demo_select_coin(cid, "long")
+
+        elif data == "demo_open_short":
+            screen_demo_select_coin(cid, "short")
+
+        elif data.startswith("demo_long_") or data.startswith("demo_short_"):
+            # demo_long_BTCUSDT  или  demo_short_ETHUSDT
+            parts  = data.split("_", 2)          # ["demo","long","BTCUSDT"]
+            side   = parts[1]
+            symbol = parts[2]
+            screen_demo_select_amount(cid, side, symbol)
+
+        elif data.startswith("demo_exec_"):
+            # demo_exec_long_BTCUSDT_50
+            parts  = data.split("_")             # ["demo","exec","long","BTCUSDT","50"]
+            side   = parts[2]                    # long / short
+            symbol = parts[3]
+            amount = float(parts[4])
+
+            send(cid, f"⏳ Открываю {'LONG 📈' if side=='long' else 'SHORT 📉'} {symbol}...")
+            user = get_user(cid)
+            ok, result = demo_open_pos(user, symbol, side.upper(), amount)
+            if ok:
+                pos  = result
+                coin = demo_coin_by_symbol(symbol)
+                save_user(cid, user)
+                send(cid,
+                     f"✅ <b>Позиция открыта!</b>\n\n"
+                     f"{pos['emoji']} <b>{pos['name']}</b>  {pos['side']} ×{pos['lev']}x\n"
+                     f"💲 Цена входа: <b>${fmt(pos['entry'])}</b>\n"
+                     f"💵 Сумма: ${fmt(pos['usdt'])} → эффективная ${fmt(pos['usdt']*pos['lev'])}\n"
+                     f"📡 Источник цены: {pos['source']}\n\n"
+                     f"💳 Остаток баланса: <b>${fmt(user['demo']['balance'])}</b>",
+                     kb_demo_back())
+            else:
+                send(cid, f"❌ {result}", kb_demo_back())
+
+        elif data == "demo_positions":
+            screen_demo_positions(cid)
+
+        elif data.startswith("demo_close_"):
+            # demo_close_BTCUSDT
+            symbol = data.replace("demo_close_", "")
+            send(cid, f"⏳ Закрываю позицию {symbol}...")
+            user = get_user(cid)
+            ok, pnl_or_err, exit_price = demo_close_pos(user, symbol)
+            if ok:
+                coin = demo_coin_by_symbol(symbol)
+                save_user(cid, user)
+                ico  = "✅ Прибыль" if pnl_or_err >= 0 else "❌ Убыток"
+                send(cid,
+                     f"{ico}: <b><code>{sign(pnl_or_err)}${fmt(abs(pnl_or_err))}</code></b>\n\n"
+                     f"{coin['emoji'] if coin else ''} {symbol[:3]} закрыт по ${fmt(exit_price)}\n"
+                     f"💳 Баланс: <b>${fmt(user['demo']['balance'])}</b>",
+                     kb_demo_back())
+            else:
+                send(cid, f"❌ {pnl_or_err}", kb_demo_back())
+
+        elif data == "demo_history":
+            screen_demo_history(cid)
+
+        elif data == "demo_reset":
             user = get_user(cid)
             d    = user["demo"]
-            pct  = pct_val(d["balance"] - d["start"], d["start"])
-            send(cid,
-                 f"🎮 <b>Демо-счёт</b>\n"
-                 f"Стартовый: $1,000\n"
-                 f"Текущий:   <b>${fmt(d['balance'])}</b>\n"
-                 f"Прибыль:   <code>{sign(pct)}{pct:.1f}%</code>\n"
-                 f"Сделок:    {d['trades']} (WR: {wr_calc(d['wins'],d['loss'])}%)", kb_back())
+            # Закрыть все позиции без расчёта P&L
+            d["positions"] = []
+            d["balance"]   = 1000.0
+            d["start"]     = 1000.0
+            d["peak"]      = 1000.0
+            d["profit"]    = 0.0
+            d["trades"]    = 0
+            d["wins"]      = 0
+            d["loss"]      = 0
+            d["history"]   = []
+            d["streak_win"]  = 0
+            d["streak_loss"] = 0
+            save_user(cid, user)
+            send(cid, "🔄 <b>Демо-баланс сброшен!</b>\nСтартовый баланс: <b>$1,000</b>", kb_demo_back())
+
+        # ── Старый быстрый просмотр демо-счёта ──────────────────────────────────
+        elif data == "demo":
+            screen_demo_trade(cid)
+
         elif data == "real":
             user = get_user(cid)
             r    = user["real"]
