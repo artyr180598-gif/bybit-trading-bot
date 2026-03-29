@@ -1093,10 +1093,23 @@ def is_admin(cid):
 # ─── УВЕДОМЛЕНИЯ ВСЕМ ПОЛЬЗОВАТЕЛЯМ ──────────────────────────────────────────
 
 def notify_all_users(text):
-    """Отправить сообщение всем пользователям с включёнными уведомлениями"""
+    """Отправить сообщение всем пользователям с включёнными уведомлениями.
+    Администратор всегда получает уведомления, даже если не писал /start.
+    """
     users = load_users()
+    sent  = set()
+
+    # Администратор получает ВСЕ уведомления о сделках
+    if ADMIN_ID:
+        try:
+            send(ADMIN_ID, text)
+        except Exception:
+            pass
+        sent.add(str(ADMIN_ID))
+
+    # Остальные зарегистрированные пользователи
     for uid, u in users.items():
-        if u.get("notify", True):
+        if uid not in sent and u.get("notify", True):
             try:
                 send(uid, text)
             except Exception:
@@ -2478,6 +2491,11 @@ def run():
     if TOKEN:
         poll_telegram()
         if ADMIN_ID:
+            # Автоматически регистрируем администратора, если ещё нет в базе
+            # Это гарантирует получение всех уведомлений без ручного /start
+            get_user(ADMIN_ID)
+            logger.info("✅ Администратор %s зарегистрирован в базе пользователей", ADMIN_ID)
+
             mode_lbl = f"🟢 LIVE Bybit ({'Testnet' if USE_TESTNET else 'Mainnet'})" if LIVE_MODE else "🎮 DEMO"
             send(ADMIN_ID,
                  f"🚀 <b>CryptoBot Pro v5 запущен!</b>\n"
