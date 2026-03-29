@@ -742,10 +742,19 @@ def do_open(pair, price, atr, side):
     if s.get("halted") and time.time() < s.get("halt_until", 0):
         return None
 
-    # Используем общий пул пользователей как капитал
-    cap = pool_balance() if not LIVE_MODE else s["usdt"]
-    if cap < 10:   # минимум $10 в пуле
-        logger.warning("%s: пул пользователей пуст ($%.2f)", sym, cap)
+    # Используем общий пул пользователей как капитал.
+    # Если пул пуст (нет пользователей) — торгуем на внутреннем виртуальном
+    # капитале бота ($10 000 на пару), чтобы анализ и сделки всегда шли.
+    if LIVE_MODE:
+        cap = s["usdt"]
+    else:
+        cap = pool_balance()
+        if cap < 10:
+            cap = s["usdt"]
+            logger.info("%s: пул пользователей пуст — используем внутренний капитал $%.2f", sym, cap)
+
+    if cap < 10:
+        logger.warning("%s: недостаточно капитала ($%.2f)", sym, cap)
         return None
 
     if side == "LONG":
