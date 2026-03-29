@@ -1789,23 +1789,66 @@ def screen_market(cid):
 
 
 def screen_history(cid):
+    text = "📈 <b>Сделки бота</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+    # ── Открытые позиции бота прямо сейчас ──
+    open_lines = ""
+    for pair in PAIRS:
+        s   = BOT_STATES.get(pair["symbol"], {})
+        pos = s.get("pos")
+        if not pos:
+            continue
+        price = fetch_price(pair["symbol"])
+        if not price:
+            continue
+        side = pos["side"]
+        fl   = (price - pos["entry"]) * pos["qty"] * LEVERAGE
+        if side == "SHORT":
+            fl = -fl
+        icon      = "📈" if side == "LONG" else "📉"
+        fl_icon   = "🟢" if fl >= 0 else "🔴"
+        sl_dist   = abs(price - pos["sl"])
+        tp_dist   = abs(price - pos["tp"])
+        open_lines += (
+            f"{icon} <b>{pair['name']}</b> {side} ×{LEVERAGE}x  [АКТИВНА]\n"
+            f"  Вход:    ${fmt(pos['entry'])}\n"
+            f"  Сейчас:  ${fmt(price)}\n"
+            f"  SL:      ${fmt(pos['sl'])}  (до SL: ${fmt(sl_dist)})\n"
+            f"  TP:      ${fmt(pos['tp'])}  (до TP: ${fmt(tp_dist)})\n"
+            f"  Float:   {fl_icon} <code>{sign(fl)}${fmt(abs(fl))}</code>\n"
+            f"  Открыта: {pos.get('time', pos.get('ts', '—'))}\n\n"
+        )
+
+    if open_lines:
+        text += "⚡ <b>Открытые сейчас:</b>\n" + open_lines
+    else:
+        s_halted = any(BOT_STATES.get(p["symbol"], {}).get("halted") for p in PAIRS)
+        if s_halted:
+            text += "⏸ <b>Торговля приостановлена</b> (circuit-breaker)\n\n"
+        else:
+            text += "⏳ Нет открытых позиций — бот ищет сигнал...\n\n"
+
+    # ── История закрытых сделок ──
     trades = all_trades()
     closes = [t for t in trades if t.get("action") == "CLOSE"][-10:]
-    if not closes:
-        send(cid, "📈 <b>Последние сделки</b>\n\nСделок пока нет — бот анализирует рынок...", kb_back())
-        return
-    text = "📈 <b>Последние 10 сделок</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    for t in reversed(closes):
-        pnl  = t.get("pnl", 0)
-        side = t.get("side", "?")
-        icon = "✅" if pnl >= 0 else "❌"
-        text += (
-            f"{icon} <b>{t.get('pair','?')}</b> {side} — {t.get('reason','?')}\n"
-            f"  ${fmt(t.get('entry',0))} → ${fmt(t.get('price',0))}\n"
-            f"  P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code> "
-            f"({sign(t.get('pnl_pct',0))}{t.get('pnl_pct',0):.1f}%)"
-            f" | {t.get('time','')}\n\n"
-        )
+    if closes:
+        text += "📋 <b>Последние закрытые:</b>\n"
+        for t in reversed(closes):
+            pnl  = t.get("pnl", 0)
+            side = t.get("side", "?")
+            icon = "✅" if pnl >= 0 else "❌"
+            text += (
+                f"{icon} <b>{t.get('pair','?')}</b> {side}"
+                f" → {t.get('reason','?')}\n"
+                f"  ${fmt(t.get('entry',0))} → ${fmt(t.get('price',0))}"
+                f"  <code>{sign(pnl)}${fmt(abs(pnl))}</code>"
+                f" ({sign(t.get('pnl_pct',0))}{t.get('pnl_pct',0):.1f}%)\n"
+                f"  {t.get('time','')}\n\n"
+            )
+    else:
+        text += "📋 <b>Закрытых сделок пока нет.</b>\n"
+        text += "История появится после первого закрытия позиции."
+
     send(cid, text, kb_back())
 
 
