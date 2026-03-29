@@ -151,34 +151,57 @@ def fetch_price(symbol):
 
 import hmac, hashlib
 
-def _bybit_sign(params: dict, ts: int) -> str:
-    param_str = str(ts) + BYBIT_KEY + "5000" + "&".join(
-        f"{k}={v}" for k, v in sorted(params.items())
-    )
-    return hmac.new(BYBIT_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
+def _bybit_sign(payload_str: str, ts: int) -> str:
+    """
+    Правильная подпись Bybit API v5:
+      GET:  payload = query_string (e.g. "accountType=UNIFIED")
+      POST: payload = json_body    (e.g. '{"category":"linear",...}')
+    Формула: HMAC-SHA256(secret, timestamp + api_key + recv_window + payload)
+    """
+    raw = f"{ts}{BYBIT_KEY}5000{payload_str}"
+    return hmac.new(
+        BYBIT_SECRET.encode("utf-8"),
+        raw.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def bybit_request(method, endpoint, params=None):
-    """Подписанный запрос к Bybit API v5"""
+    """Подписанный запрос к Bybit API v5 (GET и POST обрабатываются по-разному)"""
     if not LIVE_MODE:
         return {"retCode": 0, "result": {}}
-    params  = params or {}
-    ts      = int(time.time() * 1000)
-    sign    = _bybit_sign(params, ts)
-    headers = {
-        "X-BAPI-API-KEY":    BYBIT_KEY,
-        "X-BAPI-SIGN":       sign,
-        "X-BAPI-TIMESTAMP":  str(ts),
-        "X-BAPI-RECV-WINDOW":"5000",
-        "Content-Type":      "application/json",
-    }
-    base = _bybit_url()
+    params = params or {}
+    ts     = int(time.time() * 1000)
+    base   = _bybit_url()
     try:
         if method == "GET":
+            # Для GET: подпись от строки query-параметров
+            query_string = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            sign = _bybit_sign(query_string, ts)
+            headers = {
+                "X-BAPI-API-KEY":     BYBIT_KEY,
+                "X-BAPI-SIGN":        sign,
+                "X-BAPI-TIMESTAMP":   str(ts),
+                "X-BAPI-RECV-WINDOW": "5000",
+            }
             resp = requests.get(f"{base}{endpoint}", params=params, headers=headers, timeout=15)
         else:
-            resp = requests.post(f"{base}{endpoint}", json=params, headers=headers, timeout=15)
-        return resp.json()
+            # Для POST: подпись от JSON-тела запроса
+            body = json.dumps(params, separators=(",", ":"))
+            sign = _bybit_sign(body, ts)
+            headers = {
+                "X-BAPI-API-KEY":     BYBIT_KEY,
+                "X-BAPI-SIGN":        sign,
+                "X-BAPI-TIMESTAMP":   str(ts),
+                "X-BAPI-RECV-WINDOW": "5000",
+                "Content-Type":       "application/json",
+            }
+            resp = requests.post(f"{base}{endpoint}", data=body, headers=headers, timeout=15)
+        result = resp.json()
+        if result.get("retCode") not in (0, None):
+            logger.warning("Bybit %s %s → %s: %s",
+                           method, endpoint, result.get("retCode"), result.get("retMsg"))
+        return result
     except Exception as e:
         logger.error("bybit_request %s %s: %s", method, endpoint, e)
         return {}
@@ -229,17 +252,28 @@ def close_position(symbol, qty, side):
 
 
 def get_bybit_balance():
-    """Получить баланс USDT на Bybit"""
+    """
+    Получить баланс USDT на Bybit.
+    Пробует UNIFIED → CONTRACT → SPOT, возвращает первый найденный.
+    """
     if not LIVE_MODE:
         return None
-    r = bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
-    try:
-        coins = r["result"]["list"][0]["coin"]
-        for c in coins:
-            if c["coin"] == "USDT":
-                return float(c["walletBalance"])
-    except Exception:
-        pass
+    for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
+        try:
+            r = bybit_request("GET", "/v5/account/wallet-balance",
+                              {"accountType": account_type})
+            if r.get("retCode") != 0:
+                continue
+            lst = r.get("result", {}).get("list", [])
+            if not lst:
+                continue
+            for c in lst[0].get("coin", []):
+                if c.get("coin") == "USDT":
+                    bal = float(c.get("walletBalance", 0) or 0)
+                    logger.info("Bybit balance (%s): $%.2f", account_type, bal)
+                    return bal
+        except Exception as e:
+            logger.warning("get_bybit_balance %s: %s", account_type, e)
     return None
 
 
@@ -1108,27 +1142,74 @@ def screen_referral(cid):
 
 def screen_mode_info(cid):
     if LIVE_MODE:
+        send(cid, "⏳ Запрашиваю данные с Bybit...")
         bal = get_bybit_balance()
+
+        # Открытые позиции
+        pos_text = ""
+        open_n   = 0
+        for pair in PAIRS:
+            s   = BOT_STATES.get(pair["symbol"], {})
+            pos = s.get("pos")
+            if pos:
+                open_n += 1
+                price = fetch_price(pair["symbol"]) or pos["entry"]
+                side  = pos["side"]
+                fl    = (price - pos["entry"]) * pos["qty"] * LEVERAGE
+                if side == "SHORT":
+                    fl = -fl
+                pos_text += (
+                    f"\n  {pair['emoji']} {pair['name']} <b>{side}</b>"
+                    f" | Float: <code>{sign(fl)}${fmt(abs(fl))}</code>"
+                )
+
+        # Статистика бота
+        trades    = all_trades()
+        closes    = [t for t in trades if t.get("action") == "CLOSE"]
+        total_pnl = sum(t.get("pnl", 0) for t in closes)
+        wins      = sum(1 for t in closes if t.get("pnl", 0) >= 0)
+        wr        = wr_calc(wins, len(closes) - wins)
+
+        net_str = "🌐 Testnet" if USE_TESTNET else "🌐 Mainnet"
+        bal_str = f"<b>${fmt(bal)}</b>" if bal is not None else "<i>ошибка API</i>"
+
         text = (
-            "🟢 <b>Режим: LIVE (Bybit Testnet)</b>\n"
+            "🟢 <b>LIVE режим — Bybit</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Бот торгует на реальном Bybit через API!\n\n"
-            f"💳 Баланс USDT: <b>${fmt(bal) if bal else 'нет данных'}</b>\n"
-            f"🔑 API ключ: ...{BYBIT_KEY[-4:] if BYBIT_KEY else 'не задан'}\n"
-            f"🌐 Сеть: {'Testnet' if USE_TESTNET else 'Mainnet'}\n"
-            f"📊 Плечо: {LEVERAGE}x"
+            f"🔑 API: ...{BYBIT_KEY[-6:] if BYBIT_KEY else '—'}  |  {net_str}\n"
+            f"📊 Плечо: {LEVERAGE}x  |  Риск: {RISK_PCT}%/сделка\n\n"
+            f"💳 <b>Баланс USDT: {bal_str}</b>\n\n"
+            f"📌 Открытых позиций: {open_n}/{MAX_POS}"
         )
+        if pos_text:
+            text += f"\n{pos_text}"
+        text += (
+            f"\n\n📈 Закрытых сделок: {len(closes)}\n"
+            f"🏆 Винрейт: {wr}%\n"
+            f"💹 Суммарный P&L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>"
+        )
+
+        if bal is None:
+            text += (
+                "\n\n⚠️ <b>Не удалось получить баланс.</b>\n"
+                "Проверьте:\n"
+                "• API ключ имеет права на чтение аккаунта\n"
+                "• BYBIT_TESTNET = true (если используете testnet)\n"
+                "• Аккаунт на testnet.bybit.com пополнен"
+            )
     else:
         text = (
             "🎮 <b>Режим: DEMO (Симуляция)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Бот работает в режиме симуляции.\n"
-            "Реальные котировки Bybit, виртуальные сделки.\n\n"
+            "Реальные цены Bybit, виртуальные сделки.\n\n"
             "Чтобы включить реальную торговлю:\n"
-            "1. Зарегистрируйтесь на Bybit Testnet\n"
-            "2. Создайте API ключ\n"
-            "3. Добавьте BYBIT_API_KEY и BYBIT_API_SECRET\n"
-            "4. Перезапустите бота"
+            "1. Зайди на <b>testnet.bybit.com</b>\n"
+            "2. API → создай ключ с правами Trade + Read\n"
+            "3. В Railway добавь переменные:\n"
+            "   BYBIT_API_KEY = ...\n"
+            "   BYBIT_API_SECRET = ...\n"
+            "   BYBIT_TESTNET = true\n"
+            "4. Redeploy — и бот торгует реально!"
         )
     send(cid, text, kb_back())
 
@@ -1254,6 +1335,8 @@ def process_update(update):
             screen_stats(cid)
         elif text == "/market":
             screen_market(cid)
+        elif text == "/balance":
+            screen_mode_info(cid)
         elif text == "/admin" and is_admin(cid):
             screen_admin(cid)
         elif text == "/strategy":
