@@ -922,7 +922,7 @@ def do_open(pair, price, atr, side):
 
     # Обновляем состояние бота
     s["usdt"] = max(s.get("usdt", 10000) - margin, 0)
-    s["n"]    += 1
+    # s["n"] считается только при ЗАКРЫТИИ, не при открытии
     s["pos"]   = {
         "side": side, "entry": price, "qty": qty,
         "sl": sl, "tp": tp, "atr": atr,
@@ -1319,7 +1319,8 @@ def pool_total():
 def pool_lock(pair_name, margin):
     """
     Заморозить margin из демо-балансов всех пользователей пропорционально.
-    Вычитает из d['balance'] и добавляет в d['locked'].
+    Каждой паре ведётся отдельный учёт (locked_by_pair), чтобы при закрытии
+    одной из нескольких позиций не разморозились чужие деньги.
     Возвращает {uid: locked_amount}.
     """
     users = load_users()
@@ -1328,14 +1329,18 @@ def pool_lock(pair_name, margin):
         return {}
     locks = {}
     for uid, u in users.items():
-        d = u["demo"]
+        d   = u["demo"]
         bal = d.get("balance", 0)
         if bal <= 0:
             continue
-        share        = bal / total
-        user_margin  = round(margin * share, 4)
+        share       = bal / total
+        user_margin = round(margin * share, 4)
         d["balance"] = round(bal - user_margin, 4)
         d["locked"]  = round(d.get("locked", 0) + user_margin, 4)
+        # Храним сколько заморожено именно для этой пары
+        lbp = d.get("locked_by_pair", {})
+        lbp[pair_name] = round(lbp.get(pair_name, 0) + user_margin, 4)
+        d["locked_by_pair"] = lbp
         locks[uid]   = user_margin
         u["demo"]    = d
         users[uid]   = u
@@ -1345,23 +1350,52 @@ def pool_lock(pair_name, margin):
 
 def pool_release(pair_name, pnl, is_win):
     """
-    Разморозить locked средства + P&L каждому пользователю пропорционально.
-    Пропорция считается по locked (сколько кто внёс в эту сделку).
+    Разморозить locked средства ТОЛЬКО для данной пары + распределить P&L.
+    Это позволяет правильно работать когда одновременно открыто 2–3 позиции:
+    закрытие BTC не разморозит деньги, заложенные под ETH или SOL.
     """
-    users        = load_users()
-    total_locked = sum(u["demo"].get("locked", 0) for u in users.values())
-    if total_locked <= 0:
-        return
+    users = load_users()
+
+    # Суммарно заморожено под эту конкретную пару по всем пользователям
+    total_pair_locked = sum(
+        u["demo"].get("locked_by_pair", {}).get(pair_name, 0)
+        for u in users.values()
+    )
+    if total_pair_locked <= 0:
+        # Фолбэк: если учёт по парам не ведётся (старые данные) — используем total locked
+        total_pair_locked = sum(u["demo"].get("locked", 0) for u in users.values())
+        if total_pair_locked <= 0:
+            return
+        fallback = True
+    else:
+        fallback = False
+
     for uid, u in users.items():
-        d           = u["demo"]
-        user_locked = d.get("locked", 0)
-        if user_locked <= 0:
+        d = u["demo"]
+        if fallback:
+            pair_locked = d.get("locked", 0)
+        else:
+            pair_locked = d.get("locked_by_pair", {}).get(pair_name, 0)
+
+        if pair_locked <= 0:
             continue
-        share        = user_locked / total_locked
-        user_pnl     = round(pnl * share, 4)
-        returned     = round(user_locked + user_pnl, 4)
+
+        share    = pair_locked / total_pair_locked
+        user_pnl = round(pnl * share, 4)
+        returned = round(pair_locked + user_pnl, 4)
+
+        # Возвращаем деньги на баланс (только ту долю, что была в этой паре)
         d["balance"] = round(d.get("balance", 0) + returned, 4)
-        d["locked"]  = 0.0
+
+        # Уменьшаем total locked на сумму этой пары
+        if fallback:
+            d["locked"] = 0.0
+        else:
+            d["locked"] = round(max(0.0, d.get("locked", 0) - pair_locked), 4)
+            lbp = d.get("locked_by_pair", {})
+            lbp.pop(pair_name, None)
+            d["locked_by_pair"] = lbp
+
         d["profit"]  = round(d.get("profit", 0) + user_pnl, 4)
         d["trades"]  = d.get("trades", 0) + 1
         if is_win:
@@ -1375,9 +1409,10 @@ def pool_release(pair_name, pnl, is_win):
         d["history"] = hist[-30:]
         u["demo"]    = d
         users[uid]   = u
+
         # Личное уведомление пользователю о результате
         if u.get("notify", True):
-            icon = "✅" if is_win else "❌"
+            icon     = "✅" if is_win else "❌"
             sign_str = "+" if user_pnl >= 0 else ""
             try:
                 send(uid,
@@ -2743,8 +2778,9 @@ def trading_loop():
                                 )
                             else:
                                 trend_lbl = "📈" if trend_1d > 0 else "📉" if trend_1d < 0 else "↔️"
+                                macd_up = c["macd_h"] > df4h.iloc[-2]["macd_h"]
                                 long_s  = sum([c["ema_mid"]>c["ema_slow"], c["st_dir"]==1,
-                                               RSI_LONG_MIN<=c["rsi"]<=RSI_LONG_MAX, True])
+                                               RSI_LONG_MIN<=c["rsi"]<=RSI_LONG_MAX, macd_up])
                                 scan_lines.append(
                                     f"  {pair['emoji']} {pair['name']}: ${fmt(price)} | "
                                     f"RSI {c['rsi']:.0f} | ST {'🟢' if c['st_dir']==1 else '🔴'} | "
@@ -2779,17 +2815,26 @@ def trading_loop():
             # Еженедельный отчёт
             if now - last_report >= 86400 * 7:
                 last_report = now
-                trades  = all_trades()
-                closes  = [t for t in trades if t.get("action") == "CLOSE"]
-                week    = [t for t in closes if True]  # все доступные
-                pnl_w   = sum(t.get("pnl", 0) for t in week[-50:])
-                wins_w  = sum(1 for t in week[-50:] if t.get("pnl", 0) >= 0)
-                total_w = min(len(week), 50)
+                trades    = all_trades()
+                closes    = [t for t in trades if t.get("action") == "CLOSE"]
+                # Фильтруем только сделки за последние 7 дней
+                week = [t for t in closes
+                        if t.get("time", "")[:10] >= datetime.fromtimestamp(now - 86400*7,
+                           timezone.utc).strftime("%Y-%m-%d")]
+                if not week:
+                    week = closes[-50:]   # фолбэк: если нет дат — берём последние 50
+                pnl_w   = sum(t.get("pnl", 0) for t in week)
+                wins_w  = sum(1 for t in week if t.get("pnl", 0) >= 0)
+                total_w = len(week)
+                total_eq = sum(s.get("usdt", 0) + (s.get("pos", {}) or {}).get("margin", 0)
+                               for s in BOT_STATES.values())
                 send(ADMIN_ID,
                      f"📅 <b>Еженедельный отчёт</b>\n"
                      f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                     f"Сделок: {total_w} | WR: {wr_calc(wins_w, total_w - wins_w)}%\n"
-                     f"P&L:    <code>{sign(pnl_w)}${fmt(abs(pnl_w))}</code>\n"
+                     f"Сделок за неделю: {total_w}\n"
+                     f"WR: {wr_calc(wins_w, total_w - wins_w)}%\n"
+                     f"P&L: <code>{sign(pnl_w)}${fmt(abs(pnl_w))}</code>\n"
+                     f"Капитал бота: ${fmt(total_eq)}\n"
                      f"🕐 {ts()}")
 
         except KeyboardInterrupt:
