@@ -1590,6 +1590,40 @@ def kb_admin():
 
 # ─── ЭКРАНЫ ───────────────────────────────────────────────────────────────────
 
+def screen_welcome(cid, name=""):
+    """Экран приветствия для новых пользователей (показывается один раз)."""
+    greeting = f"<b>{name}</b>, добро пожаловать!" if name else "Добро пожаловать!"
+    text = (
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖  <b>CryptoBot Pro v5</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👋 {greeting}\n\n"
+        "Это <b>алгоритмический торговый бот</b>,\n"
+        "который торгует криптовалютой вместо тебя.\n"
+        "Без эмоций. Без усталости. 24/7.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ <b>Как это работает:</b>\n\n"
+        "  📊 Анализирует <b>BTC · ETH · SOL</b>\n"
+        "       каждые 15 минут по 4 индикаторам\n\n"
+        "  📈 Открывает сделки когда рынок\n"
+        "       даёт чёткий сигнал — LONG или SHORT\n\n"
+        "  🛡 Управляет рисками автоматически:\n"
+        f"       стоп-лосс, тейк-профит, плечо {LEVERAGE}x\n\n"
+        "  💰 Распределяет прибыль между\n"
+        "       всеми участниками пула\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎮 <b>Тебе начислено $1,000 демо-баланса.</b>\n\n"
+        "Наблюдай как бот торгует в реальном времени\n"
+        "с реальными ценами Bybit — без риска потерять деньги.\n\n"
+        "Когда будешь готов — пополни счёт и\n"
+        "бот начнёт торговать <b>на твои реальные деньги</b>.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🚀 Нажми кнопку ниже чтобы начать:"
+    )
+    kb = [[{"text": "🚀 Начать торговлю", "callback_data": "menu"}]]
+    send(cid, text, kb)
+
+
 def screen_main(cid):
     try:
         user = get_user(cid)
@@ -2343,19 +2377,29 @@ def process_update(update):
 
         if text.startswith("/start"):
             parts = text.split()
+
+            # Реферальная обработка
             if len(parts) > 1:
                 ref = parts[1]
-                users = load_users()
-                ref_uid = next((u for u, v in users.items() if v.get("ref_code") == ref), None)
-                if ref_uid and ref_uid != cid:
-                    user = get_user(cid)
-                    if not user.get("ref_by"):
-                        user["ref_by"] = ref_uid
-                        save_user(cid, user)
-                        ref_user = get_user(ref_uid)
-                        ref_user["ref_count"] = ref_user.get("ref_count", 0) + 1
-                        save_user(ref_uid, ref_user)
-            screen_main(cid)
+                all_u = load_users()
+                ref_uid = next((u for u, v in all_u.items() if v.get("ref_code") == ref), None)
+                if ref_uid and ref_uid != cid and not user.get("ref_by"):
+                    user["ref_by"] = ref_uid
+                    save_user(cid, user)
+                    ref_user = get_user(ref_uid)
+                    ref_user["ref_count"] = ref_user.get("ref_count", 0) + 1
+                    save_user(ref_uid, ref_user)
+                    send(ref_uid,
+                         f"🎉 <b>По вашей ссылке зарегистрировался новый пользователь!</b>\n"
+                         f"Вы получите 5% от его прибыли автоматически.")
+
+            if not user.get("welcomed"):
+                # Новый пользователь — показываем приветственный экран один раз
+                user["welcomed"] = True
+                save_user(cid, user)
+                screen_welcome(cid, name=name)
+            else:
+                screen_main(cid)
         elif text == "/stats":
             screen_stats(cid)
         elif text == "/market":
