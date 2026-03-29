@@ -4,7 +4,7 @@ CryptoBot Pro v5 — Автоматическая торговля (Demo + Live)
 СТРАТЕГИЯ: Scoring 3/4 — EMA + Supertrend + RSI + MACD (4H + 1D)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Рынок:     USDT Perpetual Futures (BTC, ETH, SOL)
-Таймфрейм: 4H свечи, анализ каждый час
+Таймфрейм: 4H свечи, анализ каждые 15 минут
 Плечо:     3x (настраивается через env LEVERAGE)
 
 ВХОД LONG (3 из 4 индикаторов):
@@ -108,7 +108,7 @@ RISK_PCT     = 2.0    # 2% риска на сделку
 MAX_POS      = 3
 DAY_LOSS_PCT = 6.0
 GLOBAL_DD    = 20.0
-TRADE_INT    = 3600    # анализ каждый час
+TRADE_INT    = 900     # анализ каждые 15 минут
 SL_CHECK_INT = 900     # 15 минут (проверка SL/TP)
 CMD_INT      = 3
 
@@ -1547,7 +1547,7 @@ def screen_market(cid):
         price_txt = f"${fmt(price)}" if price else "нет данных"
         text += f"{pair['emoji']} <b>{pair['name']}</b>  {price_txt}{sig_txt}{pos_txt}\n\n"
 
-    text += f"⏱ Анализ каждые 4 часа | Плечо {LEVERAGE}x"
+    text += f"⏱ Анализ каждые 15 минут | Плечо {LEVERAGE}x"
     send(cid, text, kb_back())
 
 
@@ -2266,7 +2266,7 @@ def handle_admin_cb(cid, data):
 # ─── ГЛАВНЫЙ ТОРГОВЫЙ ЦИКЛ ────────────────────────────────────────────────────
 
 def trading_loop():
-    """Основной цикл торговли — анализирует рынок каждые 4 часа"""
+    """Основной цикл торговли — анализирует рынок каждые 15 минут"""
     logger.info("=" * 60)
     logger.info("CryptoBot Pro v5 — Торговый цикл запущен")
     logger.info(f"Режим:     {'LIVE (Bybit)' if LIVE_MODE else 'DEMO (Симуляция)'}")
@@ -2300,7 +2300,7 @@ def trading_loop():
                         except Exception as e:
                             logger.error("SL/TP check %s: %s", pair["symbol"], e)
 
-            # Торговый анализ каждый час
+            # Торговый анализ каждые 15 минут
             if now - last_trade >= TRADE_INT:
                 last_trade = now
                 check_num += 1
@@ -2389,7 +2389,7 @@ def trading_loop():
 
                     time.sleep(2)
 
-                # Каждые 4 итерации (4 часа) — сводка рынка всем пользователям
+                # Каждые 4 итерации (1 час) — сводка рынка всем пользователям
                 if check_num % 4 == 0 and scan_lines:
                     active = sum(1 for s in BOT_STATES.values() if s.get("pos"))
                     mode   = "🔴 LIVE" if LIVE_MODE else "🟡 DEMO"
@@ -2402,8 +2402,8 @@ def trading_loop():
                     )
                     notify_all_users(scan_text)
 
-                # Каждые 24 итерации (~1 день) — детальная сводка
-                if check_num % 24 == 0:
+                # Каждые 96 итераций (~1 день при 15-мин цикле) — детальная сводка
+                if check_num % 96 == 0:
                     screen_stats(ADMIN_ID)
 
             # Еженедельный отчёт
