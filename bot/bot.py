@@ -258,23 +258,60 @@ def get_bybit_balance():
     """
     if not LIVE_MODE:
         return None
+    last_err = "нет ответа"
     for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
         try:
-            r = bybit_request("GET", "/v5/account/wallet-balance",
-                              {"accountType": account_type})
-            if r.get("retCode") != 0:
+            r   = bybit_request("GET", "/v5/account/wallet-balance",
+                                {"accountType": account_type})
+            rc  = r.get("retCode", -1)
+            msg = r.get("retMsg", "")
+            if rc != 0:
+                last_err = f"{account_type}: [{rc}] {msg}"
+                logger.warning("balance %s", last_err)
                 continue
             lst = r.get("result", {}).get("list", [])
             if not lst:
+                last_err = f"{account_type}: пустой список"
                 continue
-            for c in lst[0].get("coin", []):
-                if c.get("coin") == "USDT":
-                    bal = float(c.get("walletBalance", 0) or 0)
+            for coin in lst[0].get("coin", []):
+                if coin.get("coin") == "USDT":
+                    bal = float(coin.get("walletBalance", 0) or 0)
                     logger.info("Bybit balance (%s): $%.2f", account_type, bal)
                     return bal
+            last_err = f"{account_type}: USDT не найден среди монет"
         except Exception as e:
+            last_err = f"{account_type}: {e}"
             logger.warning("get_bybit_balance %s: %s", account_type, e)
+    logger.error("Баланс не получен. Причина: %s", last_err)
     return None
+
+
+def bybit_debug_info():
+    """Полная диагностика Bybit API — для команды /debug"""
+    if not LIVE_MODE:
+        return "DEMO режим — API ключи не заданы"
+    net  = "Testnet" if USE_TESTNET else "Mainnet"
+    url  = _bybit_url()
+    key  = f"...{BYBIT_KEY[-6:]}" if BYBIT_KEY else "не задан"
+    rows = [f"Ключ: {key}", f"Сеть: {net}", f"URL: {url}", ""]
+    for account_type in ("UNIFIED", "CONTRACT", "SPOT"):
+        try:
+            r   = bybit_request("GET", "/v5/account/wallet-balance",
+                                {"accountType": account_type})
+            rc  = r.get("retCode", "?")
+            msg = r.get("retMsg", "")
+            if rc == 0:
+                lst   = r.get("result", {}).get("list", [])
+                coins = []
+                if lst:
+                    for coin in lst[0].get("coin", []):
+                        coins.append(f"{coin.get('coin')}=${coin.get('walletBalance','?')}")
+                rows.append(f"OK {account_type}: {', '.join(coins) if coins else 'пусто'}")
+            else:
+                rows.append(f"ERR {account_type}: [{rc}] {msg}")
+        except Exception as e:
+            rows.append(f"EXC {account_type}: {e}")
+    return "\n".join(rows)
 
 
 def get_bybit_positions():
@@ -1337,6 +1374,14 @@ def process_update(update):
             screen_market(cid)
         elif text == "/balance":
             screen_mode_info(cid)
+        elif text == "/debug":
+            send(cid, "⏳ Проверяю подключение к Bybit...")
+            info = bybit_debug_info()
+            send(cid,
+                 f"🔧 <b>Диагностика Bybit API</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 f"<code>{info}</code>",
+                 kb_back())
         elif text == "/admin" and is_admin(cid):
             screen_admin(cid)
         elif text == "/strategy":
