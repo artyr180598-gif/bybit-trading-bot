@@ -1302,18 +1302,25 @@ def pool_release(pair_name, pnl, is_win):
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 
-def api(method, data=None):
+def api(method, data=None, _timeout=20):
+    """Вызов Telegram Bot API с повторными попытками при сбое сети."""
     if not TOKEN:
         return {}
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/{method}",
-            json=data or {}, timeout=15,
-        )
-        return r.json()
-    except Exception as e:
-        logger.error("TG %s: %s", method, e)
-        return {}
+    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json=data or {}, timeout=_timeout)
+            return r.json()
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(3)
+            else:
+                # getUpdates таймауты — ожидаемое поведение, пишем DEBUG
+                if method == "getUpdates":
+                    logger.debug("TG %s: %s", method, e)
+                else:
+                    logger.error("TG %s: %s", method, e)
+    return {}
 
 
 def send(cid, text, buttons=None):
@@ -2505,16 +2512,25 @@ def trading_loop():
 # ─── TELEGRAM POLLING ─────────────────────────────────────────────────────────
 
 def poll_telegram():
-    """Telegram long-polling в отдельном потоке"""
+    """Telegram long-polling в отдельном потоке.
+
+    Важно: Telegram держит соединение TG_POLL_TIMEOUT секунд ожидая обновления.
+    requests timeout должен быть БОЛЬШЕ чем TG_POLL_TIMEOUT, иначе Read timed out.
+    """
     import threading
+    TG_POLL_TIMEOUT = 25          # Telegram держит соединение N секунд
+    REQ_TIMEOUT     = TG_POLL_TIMEOUT + 10   # requests ждёт чуть дольше
     offset = 0
 
     def _poll():
         nonlocal offset
-        logger.info("Telegram polling запущен...")
+        logger.info("Telegram polling запущен (poll=%ds, req_timeout=%ds)...",
+                    TG_POLL_TIMEOUT, REQ_TIMEOUT)
         while True:
             try:
-                upds = api("getUpdates", {"offset": offset, "timeout": 30, "limit": 10})
+                upds = api("getUpdates",
+                           {"offset": offset, "timeout": TG_POLL_TIMEOUT, "limit": 10},
+                           _timeout=REQ_TIMEOUT)
                 for u in upds.get("result", []):
                     offset = u["update_id"] + 1
                     try:
@@ -2522,7 +2538,7 @@ def poll_telegram():
                     except Exception as e:
                         logger.error("process_update: %s", e)
             except Exception as e:
-                logger.error("polling: %s", e)
+                logger.warning("polling loop: %s — retry in 5s", e)
                 time.sleep(5)
 
     t = threading.Thread(target=_poll, daemon=True)
