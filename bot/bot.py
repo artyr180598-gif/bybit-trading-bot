@@ -120,8 +120,48 @@ BYBIT_TEST_URL= "https://api-testnet.bybit.com"
 def _bybit_url():
     return BYBIT_TEST_URL if USE_TESTNET else BYBIT_URL
 
+def _okx_symbol(symbol):
+    """Конвертировать символ Bybit в формат OKX: BTCUSDT → BTC-USDT"""
+    return symbol.replace("USDT", "-USDT")
+
+
+def _okx_bar(interval):
+    """Конвертировать интервал Bybit в OKX: 240 → 4H, D → 1D"""
+    mapping = {"1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
+               "60": "1H", "120": "2H", "240": "4H", "360": "6H",
+               "720": "12H", "D": "1D", "W": "1W", "M": "1M"}
+    return mapping.get(str(interval), "4H")
+
+
+def fetch_klines_okx(symbol, interval="240", limit=200):
+    """Резервный источник свечей — OKX (публичный API, без ключей)"""
+    try:
+        bar = _okx_bar(interval)
+        inst = _okx_symbol(symbol)
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/candles",
+            params={"instId": inst, "bar": bar, "limit": min(limit, 300)},
+            timeout=15,
+        )
+        data = r.json().get("data", [])
+        if not data:
+            return None
+        # OKX возвращает: [ts, open, high, low, close, vol, volCcy, ...]
+        # порядок — от новых к старым, разворачиваем
+        rows = [[float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5]), 0.0]
+                for c in reversed(data)]
+        df = pd.DataFrame(rows, columns=["ts","op","hi","lo","cl","vol","turnover"])
+        df.sort_values("ts", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        logger.info("fetch_klines %s: используем OKX (Bybit недоступен)", symbol)
+        return df
+    except Exception as e:
+        logger.error("fetch_klines_okx %s: %s", symbol, e)
+        return None
+
+
 def fetch_klines(symbol, interval="240", limit=200):
-    """Получить свечи с Bybit (4H = interval 240)"""
+    """Получить свечи: сначала Bybit, при ошибке — OKX"""
     try:
         r = requests.get(
             f"{BYBIT_URL}/v5/market/kline",
@@ -132,8 +172,8 @@ def fetch_klines(symbol, interval="240", limit=200):
         r.raise_for_status()
         data = r.json()
         if data.get("retCode") != 0:
-            logger.warning("kline %s/%s: %s", symbol, interval, data.get("retMsg"))
-            return None
+            logger.warning("kline %s/%s: %s — пробуем OKX", symbol, interval, data.get("retMsg"))
+            return fetch_klines_okx(symbol, interval, limit)
         rows = data["result"]["list"]
         df   = pd.DataFrame(rows, columns=["ts","op","hi","lo","cl","vol","turnover"])
         df   = df.astype({c: float for c in df.columns})
@@ -141,11 +181,13 @@ def fetch_klines(symbol, interval="240", limit=200):
         df.reset_index(drop=True, inplace=True)
         return df
     except Exception as e:
-        logger.error("fetch_klines %s: %s", symbol, e)
-        return None
+        logger.warning("fetch_klines Bybit %s: %s — пробуем OKX", symbol, e)
+        return fetch_klines_okx(symbol, interval, limit)
 
 
 def fetch_price(symbol):
+    """Получить цену: сначала Bybit, при ошибке — OKX, затем CoinGecko"""
+    # 1. Bybit futures (основной источник)
     try:
         r = requests.get(
             f"{BYBIT_URL}/v5/market/tickers",
@@ -156,7 +198,23 @@ def fetch_price(symbol):
         if lst:
             return float(lst[0]["lastPrice"])
     except Exception as e:
-        logger.error("fetch_price %s: %s", symbol, e)
+        logger.warning("fetch_price Bybit %s: %s — пробуем OKX", symbol, e)
+
+    # 2. OKX (резерв)
+    try:
+        inst = _okx_symbol(symbol)
+        r = requests.get(
+            "https://www.okx.com/api/v5/market/ticker",
+            params={"instId": inst},
+            timeout=8,
+        )
+        data = r.json().get("data", [])
+        if data:
+            logger.info("fetch_price %s: используем OKX", symbol)
+            return float(data[0]["last"])
+    except Exception as e:
+        logger.warning("fetch_price OKX %s: %s", symbol, e)
+
     return None
 
 
