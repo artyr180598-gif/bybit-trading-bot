@@ -119,8 +119,8 @@ RISK_PCT     = 2.0    # 2% риска на сделку
 MAX_POS      = 3
 DAY_LOSS_PCT = 15.0   # дневной лимит потерь (% от капитала)
 GLOBAL_DD    = 30.0   # максимальная просадка от пика (%)
-TRADE_INT    = 900     # анализ каждые 15 минут
-SL_CHECK_INT = 900     # 15 минут (проверка SL/TP)
+TRADE_INT    = 900     # анализ каждые 15 минут (4H свечи — чаще нет смысла)
+SL_CHECK_INT = 60      # проверка SL/TP каждую минуту (только fetch_price — дёшево)
 CMD_INT      = 3
 
 BYBIT_URL     = "https://api.bybit.com"
@@ -2978,7 +2978,7 @@ def trading_loop():
         try:
             now = time.time()
 
-            # Проверка SL/TP каждые 15 минут (без индикаторов — только по цене)
+            # Проверка SL/TP каждую минуту (только fetch_price, без индикаторов)
             if now - last_sl_check >= SL_CHECK_INT:
                 last_sl_check = now
                 for pair in PAIRS:
