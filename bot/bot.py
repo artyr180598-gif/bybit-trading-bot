@@ -1563,11 +1563,14 @@ def screen_main(cid):
         save_user(cid, user)
         d     = user["demo"]
         r     = user["real"]
-        d_pct = pct_val(d["balance"] - d["start"], d["start"])
-        r_pct = pct_val(r["profit"], r["deposited"]) if r["deposited"] > 0 else 0.0
+
+        locked      = d.get("locked", 0)
+        total_demo  = d["balance"] + locked          # полный капитал пользователя
+        d_pct       = pct_val(total_demo - d["start"], d["start"])
+        r_pct       = pct_val(r["profit"], r["deposited"]) if r["deposited"] > 0 else 0.0
 
         total_pnl   = sum(s.get("pnl", 0) for s in BOT_STATES.values())
-        total_trade = sum(s.get("n", 0) for s in BOT_STATES.values()) // 2
+        total_trade = sum(s.get("n", 0) for s in BOT_STATES.values())   # закрытых сделок
         total_wins  = sum(s.get("wins", 0) for s in BOT_STATES.values())
         total_loss  = sum(s.get("loss", 0) for s in BOT_STATES.values())
         wr          = wr_calc(total_wins, total_loss)
@@ -1582,6 +1585,35 @@ def screen_main(cid):
             if bal is not None:
                 bybit_bal = f"\n💳 Bybit USDT: <b>${fmt(bal)}</b>"
 
+        # Строка с демо-балансом: если есть заморозка — показываем куда ушли деньги
+        if locked > 0:
+            demo_line = (
+                f"🎮 Демо:     <b>${fmt(d['balance'])}</b>  <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
+                f"   🔒 В позициях: <b>${fmt(locked)}</b>  (всего ${fmt(total_demo)})\n"
+            )
+        else:
+            demo_line = f"🎮 Демо:     <b>${fmt(d['balance'])}</b>  <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
+
+        # Открытые позиции бота с плавающим P&L
+        bot_pos_lines = ""
+        unreal_pnl    = 0.0
+        for pair in PAIRS:
+            s   = BOT_STATES.get(pair["symbol"], {})
+            pos = s.get("pos")
+            if pos:
+                pr = fetch_price(pair["symbol"])
+                if pr:
+                    fl = (pr - pos["entry"]) * pos["qty"] * LEVERAGE
+                    if pos["side"] == "SHORT":
+                        fl = -fl
+                    unreal_pnl += fl
+                    icon = "📈" if pos["side"] == "LONG" else "📉"
+                    color = "+" if fl >= 0 else ""
+                    bot_pos_lines += (
+                        f"\n  {pair['emoji']} {pair['name']} {icon} {pos['side']}"
+                        f" | Float: <code>{color}${fmt(abs(fl))}</code>"
+                    )
+
         text = (
             f"🤖 <b>CryptoBot Pro v5</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1589,12 +1621,18 @@ def screen_main(cid):
             f"📊 Стратегия: EMA21/50 + Supertrend + RSI/MACD\n"
             f"⏱ Таймфрейм: 4H + 1D фильтр | Плечо: {LEVERAGE}x\n\n"
             f"👋 Привет, <b>{user['name']}</b>!\n\n"
-            f"🎮 Демо:     <b>${fmt(d['balance'])}</b>  <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
+            f"{demo_line}"
             f"💼 Реальный: <b>${fmt(r['balance'])}</b>  <code>{sign(r_pct)}{r_pct:.1f}%</code>\n\n"
-            f"📡 <b>Бот сейчас:</b>\n"
-            f"  Позиций: {open_p}/{MAX_POS}\n"
-            f"  Сделок:  {total_trade} (WR: {wr}%)\n"
-            f"  P&L:     <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
+            f"📡 <b>Бот торгует сейчас:</b>\n"
+            f"  Позиций открыто: {open_p}/{MAX_POS}\n"
+        )
+        if bot_pos_lines:
+            text += f"{bot_pos_lines}\n"
+            if unreal_pnl != 0:
+                text += f"  Нереализованный P&L: <code>{sign(unreal_pnl)}${fmt(abs(unreal_pnl))}</code>\n"
+        text += (
+            f"\n  Закрыто сделок: {total_trade} (WR: {wr}%)\n"
+            f"  Реализованный P&L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
         )
         send(cid, text, kb_main())
     except Exception as e:
@@ -1603,32 +1641,55 @@ def screen_main(cid):
 
 
 def screen_strategy(cid):
+    # Получаем текущие данные по каждой паре для живого анализа
+    pair_lines = ""
+    for pair in PAIRS:
+        try:
+            df   = fetch_klines(pair["symbol"], "240", 80)
+            if df is not None and len(df) >= 60:
+                df    = calc_indicators(df)
+                trend = get_daily_trend(pair["symbol"])
+                sig   = get_signal(df, trend)
+                c     = df.iloc[-1]
+                st_ico = "🟢" if c["st_dir"] == 1 else "🔴"
+                ema_ico = "📈" if c["ema_mid"] > c["ema_slow"] else "📉"
+                trend_ico = "📈" if trend > 0 else ("📉" if trend < 0 else "➡️")
+                sig_str = f"⚡ <b>{sig}</b>" if sig else "⏸ Нет сигнала"
+                pair_lines += (
+                    f"\n{pair['emoji']} <b>{pair['name']}</b> — {sig_str}\n"
+                    f"   RSI: {c['rsi']:.0f} | ST: {st_ico} | EMA: {ema_ico} | 1D: {trend_ico}\n"
+                )
+        except Exception:
+            pair_lines += f"\n{pair['emoji']} {pair['name']} — данные недоступны\n"
+
     text = (
         "📈 <b>Стратегия бота v5</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>Рынок:</b> USDT Perpetual Futures\n"
-        "<b>Пары:</b> BTC, ETH, SOL\n"
-        f"<b>Плечо:</b> {LEVERAGE}x\n"
-        "<b>Таймфрейм:</b> 4H (сигнал) + 1D (тренд)\n\n"
-        "🟢 <b>ВХОД LONG:</b>\n"
-        "  • EMA21 &gt; EMA50 (восходящий тренд)\n"
-        "  • Supertrend = 🟢 Бычий\n"
-        "  • RSI 40-65 (импульс без перегрева)\n"
-        "  • MACD гист. ≥ 0 и растёт\n"
-        "  • 1D тренд подтверждает\n\n"
-        "🔴 <b>ВХОД SHORT:</b>\n"
-        "  • EMA21 &lt; EMA50 (нисходящий тренд)\n"
-        "  • Supertrend = 🔴 Медвежий\n"
-        "  • RSI 35-60\n"
-        "  • MACD гист. ≤ 0 и падает\n"
-        "  • 1D тренд подтверждает\n\n"
-        "⚙️ <b>Риск-менеджмент:</b>\n"
-        f"  • Риск: {RISK_PCT}% капитала / сделка\n"
-        f"  • SL: ATR × {ATR_SL_MULT}\n"
-        f"  • TP: ATR × {ATR_TP_MULT}  (R:R = 1:2)\n"
-        "  • Трейлинг-стоп при движении\n"
-        f"  • Circuit-breaker: -{DAY_LOSS_PCT}% день / -{GLOBAL_DD}% от пика\n\n"
-        "🎯 <b>Цель:</b> 70-100% годовых при просадке &lt;15%"
+        "Бот торгует <b>BTC, ETH, SOL</b> в оба направления.\n"
+        "Он не живой, но анализирует 4 индикатора и\n"
+        "принимает решение на основе <b>математики</b>, без эмоций.\n\n"
+        "🟢 <b>LONG (ставка на рост)</b> — когда:\n"
+        "  • EMA21 пересекла EMA50 снизу вверх\n"
+        "  • Supertrend показывает бычий рынок\n"
+        "  • RSI в зоне 38–72 (не перегрет)\n"
+        "  • MACD-гистограмма начинает расти\n"
+        "  → Нужно 3 из 4 + дневной тренд вверх\n\n"
+        "🔴 <b>SHORT (ставка на падение)</b> — когда:\n"
+        "  • EMA21 пересекла EMA50 сверху вниз\n"
+        "  • Supertrend показывает медвежий рынок\n"
+        "  • RSI в зоне 28–62 (без перепроданности)\n"
+        "  • MACD-гистограмма начинает падать\n"
+        "  → Нужно 3 из 4 + дневной тренд вниз\n\n"
+        "⚙️ <b>Защита капитала:</b>\n"
+        f"  • Риск: {RISK_PCT}% на сделку | Плечо: {LEVERAGE}x\n"
+        f"  • Стоп-лосс: ATR×{ATR_SL_MULT} | Тейк-профит: ATR×{ATR_TP_MULT}\n"
+        "  • Трейлинг-стоп — стоп двигается за ценой\n"
+        f"  • Circuit-breaker: стоп при -{DAY_LOSS_PCT}% в день\n\n"
+        "📊 <b>Сигналы прямо сейчас:</b>"
+        f"{pair_lines}\n"
+        "💡 Бот сам выбирает LONG или SHORT — смотрит на рынок\n"
+        "каждые 15 минут. Сейчас рынок медвежий → входы SHORT.\n"
+        "Когда рынок развернётся → будут LONG."
     )
     send(cid, text, kb_back())
 
