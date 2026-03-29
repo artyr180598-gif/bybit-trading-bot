@@ -1,33 +1,47 @@
 """
-CryptoBot Pro v4 — профессиональный торговый бот (демо-режим)
+CryptoBot Pro v5 — Реальная торговля на Bybit (Testnet / Demo)
+═══════════════════════════════════════════════════════════════
+СТРАТЕГИЯ: EMA Crossover + Supertrend + RSI + MACD (4H + 1D)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Рынок:     USDT Perpetual Futures (BTC, ETH, SOL)
+Таймфрейм: 4H (основной) + 1D (фильтр тренда)
+Плечо:     3x (настраивается через env LEVERAGE)
 
-СТРАТЕГИЯ: EMA + Supertrend + RSI + MACD + Volume
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Данные:    Bybit Public API (реальные цены, бесплатно, без ключей)
-Таймфрейм: 1H (основной) + 4H (фильтр тренда)
-Сигнал входа (нужны ВСЕ условия):
-  ✅ EMA9 > EMA21 > EMA50  (восходящий тренд)
-  ✅ Supertrend = БЫЧИЙ    (ATR-трендовый индикатор)
-  ✅ RSI в диапазоне 42-68 (не перекуплен, есть импульс)
-  ✅ MACD гистограмма разворачивается вверх
-  ✅ Объём выше среднего × 1.2
-  ✅ Тренд на 4H совпадает (EMA21_4h > EMA50_4h)
-Выход:
-  🔴 Supertrend разворачивается вниз
-  🔴 RSI > 76 (перекупленность)
-  🔴 EMA9 пробивает EMA21 вниз
-  🔴 Достигнут стоп-лосс (ATR × 1.5)
-  🔴 Достигнут тейк-профит (ATR × 3.0 = R:R 1:2)
-Риск: 2% капитала на сделку | max 3 позиции | circuit-breaker -7%/-18%
+ВХОД LONG (все условия):
+  ✅ EMA21 > EMA50         (восходящий тренд)
+  ✅ Supertrend = БЫЧИЙ   (ATR-трендовый индикатор)
+  ✅ RSI в диапазоне 40-65 (есть импульс, не перекуплен)
+  ✅ MACD гистограмма ≥ 0 и растёт
+  ✅ 1D тренд: цена > EMA50(1D)
 
-ЦЕЛЬ: 70-100% годовых при максимальной просадке < 20%
+ВХОД SHORT (все условия):
+  ✅ EMA21 < EMA50         (нисходящий тренд)
+  ✅ Supertrend = МЕДВЕЖИЙ
+  ✅ RSI в диапазоне 35-60
+  ✅ MACD гистограмма ≤ 0 и падает
+  ✅ 1D тренд: цена < EMA50(1D)
+
+ВЫХОД:
+  🎯 Тейк-профит: ATR × 3.0 (R:R = 1:2)
+  ⛔ Стоп-лосс:   ATR × 1.5
+  📈 Трейлинг-стоп активируется при 50% пути к TP
+
+РИСК-МЕНЕДЖМЕНТ:
+  • 1.5% капитала на сделку
+  • Максимум 3 позиции одновременно
+  • Circuit-breaker: -5% за день / -15% от пика
+  • Плечо 3x → реальная доходность до 70-100% годовых
+
+РЕЖИМЫ:
+  • DEMO   — симуляция (без API ключей)
+  • LIVE   — реальная торговля через Bybit Testnet/Mainnet
 """
 
 import os, sys, time, json, random, string, logging, requests
 import pandas as pd
 import numpy  as np
-from datetime    import datetime, timezone
-from pathlib     import Path
+from datetime import datetime, timezone
+from pathlib  import Path
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,127 +50,246 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── ENV ──────────────────────────────────────────────────────────────────────
-TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-ADMIN_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-ADMIN_IDS = os.environ.get("ADMIN_IDS", ADMIN_ID)
-WALLET   = os.environ.get("USDT_WALLET", "ЗАДАЙТЕ_USDT_WALLET")
+# ─── КОНФИГУРАЦИЯ ─────────────────────────────────────────────────────────────
+TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+ADMIN_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+ADMIN_IDS   = os.environ.get("ADMIN_IDS", ADMIN_ID)
+WALLET      = os.environ.get("USDT_WALLET", "ЗАДАЙТЕ_USDT_WALLET")
 
-DATA_DIR    = Path("data")
+# Bybit API (для реальной торговли)
+BYBIT_KEY    = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+USE_TESTNET  = os.environ.get("BYBIT_TESTNET", "true").lower() == "true"
+LEVERAGE     = int(os.environ.get("BYBIT_LEVERAGE", "3"))
+
+LIVE_MODE = bool(BYBIT_KEY and BYBIT_SECRET)
+
+DATA_DIR   = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 USERS_FILE  = DATA_DIR / "users.json"
 TRADES_FILE = DATA_DIR / "bot_trades.jsonl"
-REFS_FILE   = DATA_DIR / "referrals.json"
 
-# ─── ТОРГОВЫЕ ПАРЫ (Bybit символы) ────────────────────────────────────────────
+# ─── ТОРГОВЫЕ ПАРЫ ────────────────────────────────────────────────────────────
 PAIRS = [
-    {"symbol": "BTCUSDT", "name": "BTC", "emoji": "₿"},
-    {"symbol": "ETHUSDT", "name": "ETH", "emoji": "Ξ"},
-    {"symbol": "SOLUSDT", "name": "SOL", "emoji": "◎"},
+    {"symbol": "BTCUSDT", "name": "BTC", "emoji": "₿",  "min_qty": 0.001},
+    {"symbol": "ETHUSDT", "name": "ETH", "emoji": "Ξ",  "min_qty": 0.01},
+    {"symbol": "SOLUSDT", "name": "SOL", "emoji": "◎",  "min_qty": 0.1},
 ]
 
 # ─── ПАРАМЕТРЫ СТРАТЕГИИ ──────────────────────────────────────────────────────
-EMA_FAST     = 9
 EMA_MID      = 21
 EMA_SLOW     = 50
-MACD_FAST    = 12
-MACD_SLOW    = 26
-MACD_SIG     = 9
 RSI_PERIOD   = 14
-RSI_MIN      = 42
-RSI_MAX      = 68
-RSI_OB       = 76
+RSI_LONG_MIN = 40
+RSI_LONG_MAX = 65
+RSI_SHORT_MIN= 35
+RSI_SHORT_MAX= 60
 ATR_PERIOD   = 14
 ATR_SL_MULT  = 1.5
 ATR_TP_MULT  = 3.0
 ATR_TRAIL    = 1.2
 ST_MULT      = 3.0
 ST_PERIOD    = 10
-VOL_MA_P     = 20
-VOL_MULT     = 1.2
-RISK_PCT     = 2.0
+MACD_FAST    = 12
+MACD_SLOW    = 26
+MACD_SIG     = 9
+RISK_PCT     = 1.5
 MAX_POS      = 3
-DAY_LOSS_PCT = 7.0
-GLOBAL_DD    = 18.0
-TRADE_INT    = 3600
+DAY_LOSS_PCT = 5.0
+GLOBAL_DD    = 15.0
+TRADE_INT    = 14400   # 4 часа
 CMD_INT      = 3
 
-BYBIT_URL = "https://api.bybit.com"
+BYBIT_URL     = "https://api.bybit.com"
+BYBIT_TEST_URL= "https://api-testnet.bybit.com"
 
-# ─── BYBIT PUBLIC API ─────────────────────────────────────────────────────────
+# ─── BYBIT PUBLIC API (котировки) ─────────────────────────────────────────────
 
-def fetch_bybit_klines(symbol, interval="60", limit=200):
+def _bybit_url():
+    return BYBIT_TEST_URL if USE_TESTNET else BYBIT_URL
+
+def fetch_klines(symbol, interval="240", limit=200):
+    """Получить свечи с Bybit (4H = interval 240)"""
     try:
         r = requests.get(
             f"{BYBIT_URL}/v5/market/kline",
-            params={"category": "spot", "symbol": symbol, "interval": interval, "limit": limit},
+            params={"category": "linear", "symbol": symbol,
+                    "interval": interval, "limit": limit},
             timeout=15,
         )
         r.raise_for_status()
         data = r.json()
-        if data.get("retCode") != 0 or not data.get("result", {}).get("list"):
-            logger.warning("Bybit kline %s/%s: %s", symbol, interval, data.get("retMsg"))
+        if data.get("retCode") != 0:
+            logger.warning("kline %s/%s: %s", symbol, interval, data.get("retMsg"))
             return None
         rows = data["result"]["list"]
-        df   = pd.DataFrame(rows, columns=["ts", "op", "hi", "lo", "cl", "vol", "turnover"])
-        df   = df.astype({c: float for c in ["ts","op","hi","lo","cl","vol","turnover"]})
+        df   = pd.DataFrame(rows, columns=["ts","op","hi","lo","cl","vol","turnover"])
+        df   = df.astype({c: float for c in df.columns})
         df.sort_values("ts", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
     except Exception as e:
-        logger.error("fetch_bybit_klines %s: %s", symbol, e)
+        logger.error("fetch_klines %s: %s", symbol, e)
         return None
 
 
-def fetch_bybit_price(symbol):
+def fetch_price(symbol):
     try:
         r = requests.get(
             f"{BYBIT_URL}/v5/market/tickers",
-            params={"category": "spot", "symbol": symbol},
+            params={"category": "linear", "symbol": symbol},
             timeout=10,
         )
-        r.raise_for_status()
         lst = r.json().get("result", {}).get("list", [])
         if lst:
             return float(lst[0]["lastPrice"])
     except Exception as e:
-        logger.error("fetch_bybit_price %s: %s", symbol, e)
+        logger.error("fetch_price %s: %s", symbol, e)
     return None
+
+# ─── BYBIT TRADING API (реальные ордера) ──────────────────────────────────────
+
+import hmac, hashlib
+
+def _bybit_sign(params: dict, ts: int) -> str:
+    param_str = str(ts) + BYBIT_KEY + "5000" + "&".join(
+        f"{k}={v}" for k, v in sorted(params.items())
+    )
+    return hmac.new(BYBIT_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
+
+
+def bybit_request(method, endpoint, params=None):
+    """Подписанный запрос к Bybit API v5"""
+    if not LIVE_MODE:
+        return {"retCode": 0, "result": {}}
+    params  = params or {}
+    ts      = int(time.time() * 1000)
+    sign    = _bybit_sign(params, ts)
+    headers = {
+        "X-BAPI-API-KEY":    BYBIT_KEY,
+        "X-BAPI-SIGN":       sign,
+        "X-BAPI-TIMESTAMP":  str(ts),
+        "X-BAPI-RECV-WINDOW":"5000",
+        "Content-Type":      "application/json",
+    }
+    base = _bybit_url()
+    try:
+        if method == "GET":
+            resp = requests.get(f"{base}{endpoint}", params=params, headers=headers, timeout=15)
+        else:
+            resp = requests.post(f"{base}{endpoint}", json=params, headers=headers, timeout=15)
+        return resp.json()
+    except Exception as e:
+        logger.error("bybit_request %s %s: %s", method, endpoint, e)
+        return {}
+
+
+def set_leverage(symbol):
+    """Установить плечо для пары"""
+    if not LIVE_MODE:
+        return
+    bybit_request("POST", "/v5/position/set-leverage", {
+        "category": "linear", "symbol": symbol,
+        "buyLeverage": str(LEVERAGE), "sellLeverage": str(LEVERAGE)
+    })
+
+
+def place_order(symbol, side, qty, sl_price, tp_price, reduce_only=False):
+    """
+    Разместить ордер на Bybit
+    side: 'Buy' или 'Sell'
+    """
+    if not LIVE_MODE:
+        return {"retCode": 0, "result": {"orderId": f"DEMO_{int(time.time())}"}}
+
+    params = {
+        "category":    "linear",
+        "symbol":      symbol,
+        "side":        side,
+        "orderType":   "Market",
+        "qty":         str(qty),
+        "reduceOnly":  reduce_only,
+        "timeInForce": "GoodTillCancel",
+    }
+    if not reduce_only:
+        params["stopLoss"] = str(round(sl_price, 2))
+        params["takeProfit"] = str(round(tp_price, 2))
+        params["slTriggerBy"] = "MarkPrice"
+        params["tpTriggerBy"] = "MarkPrice"
+
+    result = bybit_request("POST", "/v5/order/create", params)
+    if result.get("retCode") != 0:
+        logger.error("place_order %s %s: %s", symbol, side, result.get("retMsg"))
+    return result
+
+
+def close_position(symbol, qty, side):
+    """Закрыть позицию (side = сторона закрытия: Buy чтобы закрыть Short, Sell чтобы закрыть Long)"""
+    return place_order(symbol, side, qty, 0, 0, reduce_only=True)
+
+
+def get_bybit_balance():
+    """Получить баланс USDT на Bybit"""
+    if not LIVE_MODE:
+        return None
+    r = bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+    try:
+        coins = r["result"]["list"][0]["coin"]
+        for c in coins:
+            if c["coin"] == "USDT":
+                return float(c["walletBalance"])
+    except Exception:
+        pass
+    return None
+
+
+def get_bybit_positions():
+    """Получить открытые позиции"""
+    if not LIVE_MODE:
+        return {}
+    positions = {}
+    for p in PAIRS:
+        r = bybit_request("GET", "/v5/position/list",
+                          {"category": "linear", "symbol": p["symbol"]})
+        try:
+            lst = r["result"]["list"]
+            for pos in lst:
+                if float(pos.get("size", 0)) > 0:
+                    positions[p["symbol"]] = pos
+        except Exception:
+            pass
+    return positions
 
 # ─── ИНДИКАТОРЫ ───────────────────────────────────────────────────────────────
 
 def calc_indicators(df):
     df = df.copy()
-    df["ema_fast"] = df["cl"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema_mid"]  = df["cl"].ewm(span=EMA_MID,  adjust=False).mean()
     df["ema_slow"] = df["cl"].ewm(span=EMA_SLOW, adjust=False).mean()
 
-    hl  = df["hi"] - df["lo"]
-    hc  = (df["hi"] - df["cl"].shift()).abs()
-    lc  = (df["lo"] - df["cl"].shift()).abs()
-    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    hl = df["hi"] - df["lo"]
+    hc = (df["hi"] - df["cl"].shift()).abs()
+    lc = (df["lo"] - df["cl"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["atr"] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
 
     # Supertrend
-    hl2    = (df["hi"] + df["lo"]) / 2
-    upper  = hl2 + ST_MULT * df["atr"]
-    lower  = hl2 - ST_MULT * df["atr"]
-    f_up   = upper.copy()
-    f_lo   = lower.copy()
+    hl2   = (df["hi"] + df["lo"]) / 2
+    upper = hl2 + ST_MULT * df["atr"]
+    lower = hl2 - ST_MULT * df["atr"]
+    f_up  = upper.copy()
+    f_lo  = lower.copy()
     st_dir = [1] * len(df)
-    st_val = [0.0] * len(df)
 
     for i in range(1, len(df)):
         if upper.iloc[i] < f_up.iloc[i-1] or df["cl"].iloc[i-1] > f_up.iloc[i-1]:
             f_up.iloc[i] = upper.iloc[i]
         else:
             f_up.iloc[i] = f_up.iloc[i-1]
-
         if lower.iloc[i] > f_lo.iloc[i-1] or df["cl"].iloc[i-1] < f_lo.iloc[i-1]:
             f_lo.iloc[i] = lower.iloc[i]
         else:
             f_lo.iloc[i] = f_lo.iloc[i-1]
-
         if st_dir[i-1] == -1 and df["cl"].iloc[i] > f_up.iloc[i-1]:
             st_dir[i] = 1
         elif st_dir[i-1] == 1 and df["cl"].iloc[i] < f_lo.iloc[i-1]:
@@ -164,67 +297,78 @@ def calc_indicators(df):
         else:
             st_dir[i] = st_dir[i-1]
 
-        st_val[i] = f_lo.iloc[i] if st_dir[i] == 1 else f_up.iloc[i]
-
-    df["st"]     = st_val
     df["st_dir"] = st_dir
 
+    # RSI
     delta = df["cl"].diff()
     gain  = delta.clip(lower=0).ewm(span=RSI_PERIOD, adjust=False).mean()
     loss  = (-delta.clip(upper=0)).ewm(span=RSI_PERIOD, adjust=False).mean()
     rs    = gain / loss.replace(0, float("inf"))
     df["rsi"] = 100 - (100 / (1 + rs))
 
+    # MACD
     mf          = df["cl"].ewm(span=MACD_FAST, adjust=False).mean()
     ms          = df["cl"].ewm(span=MACD_SLOW, adjust=False).mean()
     mc          = (mf - ms).ewm(span=MACD_SIG, adjust=False).mean()
     df["macd_h"] = (mf - ms) - mc
-
-    df["vol_ma"] = df["vol"].rolling(VOL_MA_P).mean()
     return df
 
 
-def get_4h_trend(symbol):
-    df4 = fetch_bybit_klines(symbol, interval="240", limit=80)
-    if df4 is None or len(df4) < 60:
+def get_daily_trend(symbol):
+    """Получить дневной тренд (1D) — фильтр для снижения ложных сигналов"""
+    df1d = fetch_klines(symbol, interval="D", limit=60)
+    if df1d is None or len(df1d) < 55:
         return 0
-    df4  = calc_indicators(df4)
-    last = df4.iloc[-1]
-    if last["ema_mid"] > last["ema_slow"] and last["st_dir"] == 1:
-        return 1
-    if last["ema_mid"] < last["ema_slow"] and last["st_dir"] == -1:
-        return -1
+    df1d = calc_indicators(df1d)
+    last = df1d.iloc[-1]
+    if last["cl"] > last["ema_slow"]:
+        return 1   # Бычий
+    if last["cl"] < last["ema_slow"]:
+        return -1  # Медвежий
     return 0
 
 
-def get_signal(df, trend_4h):
-    if len(df) < 3:
+def get_signal(df4h, trend_1d):
+    """
+    Сигнал на основе 4H данных + 1D тренда
+    Возвращает: 'LONG', 'SHORT' или None
+    """
+    if len(df4h) < 3:
         return None
-    c  = df.iloc[-1]
-    p  = df.iloc[-2]
-    p2 = df.iloc[-3]
+    c  = df4h.iloc[-1]
+    p  = df4h.iloc[-2]
 
-    ema_bull  = (c["ema_fast"] > c["ema_mid"]) and (c["ema_mid"] > c["ema_slow"])
+    ema_bull  = c["ema_mid"] > c["ema_slow"]
+    ema_bear  = c["ema_mid"] < c["ema_slow"]
     st_bull   = c["st_dir"] == 1
-    rsi_ok    = RSI_MIN <= c["rsi"] <= RSI_MAX
-    macd_up   = (c["macd_h"] > p["macd_h"]) and (p["macd_h"] > p2["macd_h"] or c["macd_h"] >= 0)
-    vol_ok    = (c["vol_ma"] > 0) and (c["vol"] >= c["vol_ma"] * VOL_MULT)
-    trend_ok  = trend_4h >= 0
+    st_bear   = c["st_dir"] == -1
+    rsi_long  = RSI_LONG_MIN  <= c["rsi"] <= RSI_LONG_MAX
+    rsi_short = RSI_SHORT_MIN <= c["rsi"] <= RSI_SHORT_MAX
+    macd_up   = c["macd_h"] >= 0 and c["macd_h"] > p["macd_h"]
+    macd_down = c["macd_h"] <= 0 and c["macd_h"] < p["macd_h"]
+    day_up    = trend_1d >= 0
+    day_down  = trend_1d <= 0
 
-    buy = ema_bull and st_bull and rsi_ok and macd_up and vol_ok and trend_ok
-
-    ema_cross = c["ema_fast"] < c["ema_mid"] and p["ema_fast"] >= p["ema_mid"]
-    st_flip   = c["st_dir"] == -1 and p["st_dir"] == 1
-    rsi_ob    = c["rsi"] >= RSI_OB
-    macd_down = (c["macd_h"] < 0) and (p["macd_h"] >= 0)
-
-    sell = st_flip or rsi_ob or ema_cross or macd_down
-
-    if buy:
-        return "BUY"
-    if sell:
-        return "SELL"
+    if ema_bull and st_bull and rsi_long and macd_up and day_up:
+        return "LONG"
+    if ema_bear and st_bear and rsi_short and macd_down and day_down:
+        return "SHORT"
     return None
+
+
+def check_exit_signal(df4h, side):
+    """Проверить сигнал на выход из позиции"""
+    c = df4h.iloc[-1]
+    p = df4h.iloc[-2]
+    if side == "LONG":
+        return (c["st_dir"] == -1 and p["st_dir"] == 1) or \
+               (c["ema_mid"] < c["ema_slow"]) or \
+               c["rsi"] > 75
+    if side == "SHORT":
+        return (c["st_dir"] == 1 and p["st_dir"] == -1) or \
+               (c["ema_mid"] > c["ema_slow"]) or \
+               c["rsi"] < 25
+    return False
 
 # ─── СОСТОЯНИЕ БОТА ───────────────────────────────────────────────────────────
 
@@ -240,10 +384,9 @@ def load_bot_state(sym):
         except Exception:
             pass
     return {
-        "usdt": 10000.0, "coin": 0.0, "pos": None,
-        "n": 0, "wins": 0, "loss": 0, "pnl": 0.0,
+        "usdt": 10000.0, "n": 0, "wins": 0, "loss": 0, "pnl": 0.0,
         "peak": 10000.0, "day_start": 10000.0, "day_date": "",
-        "halted": False, "halt_until": 0,
+        "halted": False, "halt_until": 0, "pos": None,
     }
 
 
@@ -262,10 +405,10 @@ def all_trades():
     if TRADES_FILE.exists():
         with open(TRADES_FILE, encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if line:
+                l = line.strip()
+                if l:
                     try:
-                        trades.append(json.loads(line))
+                        trades.append(json.loads(l))
                     except Exception:
                         pass
     return trades
@@ -276,62 +419,116 @@ def active_positions():
 
 # ─── ИСПОЛНЕНИЕ СДЕЛОК ────────────────────────────────────────────────────────
 
-def do_buy(pair, price, atr):
-    s = BOT_STATES[pair["symbol"]]
+def do_open(pair, price, atr, side):
+    """Открыть позицию (LONG или SHORT)"""
+    s   = BOT_STATES[pair["symbol"]]
+    sym = pair["symbol"]
     if s.get("pos") or active_positions() >= MAX_POS:
         return None
     if s.get("halted") and time.time() < s.get("halt_until", 0):
         return None
 
-    sl   = round(price - ATR_SL_MULT * atr, 6)
-    tp   = round(price + ATR_TP_MULT * atr, 6)
-    risk = s["usdt"] * (RISK_PCT / 100)
-    qty  = round(risk / max(price - sl, 0.000001), 8)
-    cost = qty * price
-    if cost > s["usdt"] * 0.95:
-        qty  = round(s["usdt"] * 0.95 / price, 8)
-        cost = qty * price
-    if qty <= 0:
-        return None
+    if side == "LONG":
+        sl = price - ATR_SL_MULT * atr
+        tp = price + ATR_TP_MULT * atr
+    else:
+        sl = price + ATR_SL_MULT * atr
+        tp = price - ATR_TP_MULT * atr
 
-    s["usdt"] -= cost
-    s["coin"]  = qty
+    sl = round(sl, 2)
+    tp = round(tp, 2)
+
+    # Размер позиции: риск 1.5% капитала
+    risk    = s["usdt"] * (RISK_PCT / 100)
+    sl_dist = abs(price - sl)
+    qty     = round(risk / max(sl_dist, 0.0001), 6)
+    qty     = max(qty, pair["min_qty"])
+
+    # С учётом плеча
+    position_value = qty * price
+    margin_needed  = position_value / LEVERAGE
+    if margin_needed > s["usdt"] * 0.95:
+        qty = round(s["usdt"] * 0.95 * LEVERAGE / price, 6)
+        qty = max(qty, pair["min_qty"])
+
+    # Реальный ордер на Bybit
+    if LIVE_MODE:
+        set_leverage(sym)
+        order_side = "Buy" if side == "LONG" else "Sell"
+        result     = place_order(sym, order_side, qty, sl, tp)
+        if result.get("retCode") != 0:
+            logger.error("Ошибка ордера %s: %s", sym, result.get("retMsg"))
+            return None
+        order_id = result.get("result", {}).get("orderId", "")
+    else:
+        order_id = f"DEMO_{sym}_{int(time.time())}"
+
+    # Обновляем состояние (демо-режим вычитает маржу)
+    margin = qty * price / LEVERAGE
+    s["usdt"] -= margin
     s["n"]    += 1
     s["pos"]   = {
-        "entry": price, "qty": qty, "sl": sl, "tp": tp,
-        "trail_sl": sl, "atr": atr, "time": ts(),
-        "id": f"T{pair['name']}-{s['n']:04d}",
+        "side": side, "entry": price, "qty": qty,
+        "sl": sl, "tp": tp, "atr": atr,
+        "trail_sl": sl, "time": ts(),
+        "id": order_id,
+        "margin": margin,
     }
-    save_bot_state(pair["symbol"], s)
-    t = {**s["pos"], "side": "BUY", "pair": pair["name"],
-         "equity_after": round(s["usdt"] + qty * price, 2)}
+    save_bot_state(sym, s)
+    t = {**s["pos"], "pair": pair["name"], "action": "OPEN",
+         "equity": round(s["usdt"] + margin, 2)}
     log_trade(t)
     return t
 
 
 def update_trailing(pair, price):
+    """Обновить трейлинг-стоп"""
     s   = BOT_STATES[pair["symbol"]]
     pos = s.get("pos")
     if not pos:
         return
-    new_sl = round(price - ATR_TRAIL * pos["atr"], 6)
-    if new_sl > pos.get("trail_sl", pos["sl"]):
-        pos["trail_sl"] = new_sl
-        pos["sl"]       = new_sl
-        s["pos"]        = pos
-        save_bot_state(pair["symbol"], s)
+    atr  = pos["atr"]
+    side = pos["side"]
+
+    if side == "LONG":
+        new_sl = round(price - ATR_TRAIL * atr, 2)
+        if new_sl > pos.get("trail_sl", pos["sl"]) and new_sl > pos["sl"]:
+            pos["sl"] = pos["trail_sl"] = new_sl
+    else:
+        new_sl = round(price + ATR_TRAIL * atr, 2)
+        if new_sl < pos.get("trail_sl", pos["sl"]) and new_sl < pos["sl"]:
+            pos["sl"] = pos["trail_sl"] = new_sl
+
+    s["pos"] = pos
+    save_bot_state(pair["symbol"], s)
 
 
-def do_sell(pair, price, reason="SIGNAL"):
+def do_close(pair, price, reason="SIGNAL"):
+    """Закрыть позицию"""
     s   = BOT_STATES[pair["symbol"]]
+    sym = pair["symbol"]
     pos = s.get("pos")
-    if not pos or s.get("coin", 0) <= 0:
+    if not pos:
         return None
 
+    side = pos["side"]
     qty  = pos["qty"]
-    pnl  = round((price - pos["entry"]) * qty, 4)
-    s["usdt"] += qty * price
-    s["coin"]  = 0.0
+
+    if side == "LONG":
+        pnl = (price - pos["entry"]) * qty * LEVERAGE
+    else:
+        pnl = (pos["entry"] - price) * qty * LEVERAGE
+
+    pnl = round(pnl, 4)
+
+    # Реальное закрытие на Bybit
+    if LIVE_MODE:
+        close_side = "Sell" if side == "LONG" else "Buy"
+        close_position(sym, qty, close_side)
+
+    # Обновляем баланс
+    margin     = pos["margin"]
+    s["usdt"] += margin + pnl
     s["pnl"]  += pnl
     s["n"]    += 1
     if pnl >= 0:
@@ -342,47 +539,74 @@ def do_sell(pair, price, reason="SIGNAL"):
         s["peak"] = s["usdt"]
 
     t = {
-        "side": "SELL", "pair": pair["name"], "qty": round(qty, 8),
-        "entry": pos["entry"], "price": price, "pnl": pnl,
+        "pair": pair["name"], "action": "CLOSE",
+        "side": side, "qty": qty,
+        "entry": pos["entry"], "price": price,
+        "pnl": pnl, "pnl_pct": round(pnl / margin * 100, 2) if margin else 0,
         "reason": reason, "time": ts(),
-        "id": f"T{pair['name']}-{s['n']:04d}",
-        "equity_after": round(s["usdt"], 2),
+        "equity": round(s["usdt"], 2),
     }
     s["pos"] = None
-    save_bot_state(pair["symbol"], s)
+    save_bot_state(sym, s)
     log_trade(t)
     distribute(pair["name"], pnl, pnl >= 0)
     return t
 
 
-def check_exits(pair, price):
+def check_exits(pair, price, df4h):
+    """Проверить SL/TP и сигнальный выход"""
     s   = BOT_STATES[pair["symbol"]]
     pos = s.get("pos")
     if not pos:
         return False
     update_trailing(pair, price)
-    pos = s["pos"]
+    pos  = s["pos"]
+    side = pos["side"]
 
-    if price <= pos["sl"]:
-        t = do_sell(pair, price, "STOP-LOSS")
+    hit_sl = (side == "LONG"  and price <= pos["sl"]) or \
+             (side == "SHORT" and price >= pos["sl"])
+    hit_tp = (side == "LONG"  and price >= pos["tp"]) or \
+             (side == "SHORT" and price <= pos["tp"])
+
+    if hit_sl:
+        t   = do_close(pair, price, "STOP-LOSS")
         if t:
             pnl = t["pnl"]
+            icon = "⛔"
             send(ADMIN_ID,
-                 f"⛔ <b>СТОП-ЛОСС | {pair['emoji']} {pair['name']}</b>\n"
-                 f"Вход ${fmt(pos['entry'])} → Выход ${fmt(price)}\n"
-                 f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code>\n"
+                 f"{icon} <b>СТОП-ЛОСС | {pair['emoji']} {pair['name']} {side}</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"Вход: <b>${fmt(pos['entry'])}</b> → Выход: <b>${fmt(price)}</b>\n"
+                 f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code> "
+                 f"({sign(t['pnl_pct'])}{t['pnl_pct']:.1f}%)\n"
                  f"Баланс: <b>${fmt(BOT_STATES[pair['symbol']]['usdt'])}</b>\n"
                  f"🕐 {ts()}")
         return True
 
-    if price >= pos["tp"]:
-        t = do_sell(pair, price, "TAKE-PROFIT")
+    if hit_tp:
+        t   = do_close(pair, price, "TAKE-PROFIT")
         if t:
             pnl = t["pnl"]
             send(ADMIN_ID,
-                 f"🎯 <b>ТЕЙК-ПРОФИТ | {pair['emoji']} {pair['name']}</b>\n"
-                 f"Вход ${fmt(pos['entry'])} → Выход ${fmt(price)}\n"
-                 f"P&L: <code>+${fmt(pnl)}</code>\n"
+                 f"🎯 <b>ТЕЙК-ПРОФИТ | {pair['emoji']} {pair['name']} {side}</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"Вход: <b>${fmt(pos['entry'])}</b> → Выход: <b>${fmt(price)}</b>\n"
+                 f"P&L: <code>+${fmt(pnl)}</code> "
+                 f"({sign(t['pnl_pct'])}{t['pnl_pct']:.1f}%)\n"
+                 f"Баланс: <b>${fmt(BOT_STATES[pair['symbol']]['usdt'])}</b>\n"
+                 f"🕐 {ts()}")
+        return True
+
+    if df4h is not None and check_exit_signal(df4h, side):
+        t   = do_close(pair, price, "SIGNAL-EXIT")
+        if t:
+            pnl = t["pnl"]
+            icon = "✅" if pnl >= 0 else "❌"
+            send(ADMIN_ID,
+                 f"{icon} <b>ВЫХОД | {pair['emoji']} {pair['name']} {side}</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"Вход: ${fmt(pos['entry'])} → Выход: ${fmt(price)}\n"
+                 f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code>\n"
                  f"Баланс: <b>${fmt(BOT_STATES[pair['symbol']]['usdt'])}</b>\n"
                  f"🕐 {ts()}")
         return True
@@ -434,7 +658,7 @@ def circuit_breaker(sym):
     save_bot_state(sym, s)
     return s.get("halted", False)
 
-# ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ──────────────────────────────────────────────────
+# ─── УТИЛИТЫ ──────────────────────────────────────────────────────────────────
 
 def ts():
     return datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
@@ -492,9 +716,7 @@ def get_user(cid):
             },
             "notify": True,
             "ref_code": _gen_ref(),
-            "ref_by": None,
-            "ref_count": 0,
-            "ref_bonus": 0.0,
+            "ref_by": None, "ref_count": 0, "ref_bonus": 0.0,
             "last_seen": ts(),
         }
         save_users(users)
@@ -502,7 +724,7 @@ def get_user(cid):
 
 
 def save_user(cid, u):
-    users     = load_users()
+    users = load_users()
     users[str(cid)] = u
     save_users(users)
 
@@ -523,12 +745,11 @@ def distribute(pair_name, pnl, is_win):
             continue
         share    = r["deposited"] / total_dep
         user_pnl = round(pnl * share, 4)
-        r["profit"]   += user_pnl
-        r["balance"]  += user_pnl
+        r["profit"]  += user_pnl
+        r["balance"] += user_pnl
         if r["autocompound"] and user_pnl > 0:
             r["deposited"] += user_pnl
-        r["trades"]   += 1
-        (r["wins"] if is_win else r["loss"]) 
+        r["trades"] += 1
         if is_win:
             r["wins"] += 1
         else:
@@ -542,21 +763,23 @@ def distribute(pair_name, pnl, is_win):
             icon = "✅" if is_win else "❌"
             send(uid,
                  f"{icon} <b>{pair_name}</b> — сделка закрыта\n"
-                 f"Ваш P&L: <code>{sign(user_pnl)}${fmt(abs(user_pnl))}</code>\n"
+                 f"P&L: <code>{sign(user_pnl)}${fmt(abs(user_pnl))}</code>\n"
                  f"Баланс: <b>${fmt(r['balance'])}</b>")
     save_users(users)
 
-# ─── TELEGRAM API ─────────────────────────────────────────────────────────────
+# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 
 def api(method, data=None):
     if not TOKEN:
         return {}
-    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
     try:
-        r = requests.post(url, json=data or {}, timeout=15)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/{method}",
+            json=data or {}, timeout=15,
+        )
         return r.json()
     except Exception as e:
-        logger.error("TG API %s: %s", method, e)
+        logger.error("TG %s: %s", method, e)
         return {}
 
 
@@ -578,17 +801,22 @@ def answer_cb(cb_id, text=""):
 # ─── КНОПКИ ───────────────────────────────────────────────────────────────────
 
 def kb_main():
+    mode = "🟢 LIVE (Bybit)" if LIVE_MODE else "🎮 DEMO"
     return [
-        [{"text": "👤 Аккаунт",              "callback_data": "account"},
-         {"text": "📊 Статистика бота",      "callback_data": "stats"}],
-        [{"text": "🌐 Рынок сейчас",         "callback_data": "market"},
-         {"text": "📈 Последние сделки",     "callback_data": "history"}],
-        [{"text": "💰 Пополнить",            "callback_data": "deposit"},
-         {"text": "💸 Вывести",             "callback_data": "withdraw"}],
-        [{"text": "🤝 Реферальная программа","callback_data": "referral"}],
-        [{"text": "❓ Как это работает",     "callback_data": "help"},
-         {"text": "🔔 Уведомления",         "callback_data": "toggle_notify"}],
+        [{"text": "👤 Аккаунт",            "callback_data": "account"},
+         {"text": "📊 Статистика",         "callback_data": "stats"}],
+        [{"text": "🌐 Рынок",              "callback_data": "market"},
+         {"text": "📈 Сделки",             "callback_data": "history"}],
+        [{"text": "💰 Пополнить",          "callback_data": "deposit"},
+         {"text": "💸 Вывести",           "callback_data": "withdraw"}],
+        [{"text": "🤝 Реферальная",        "callback_data": "referral"},
+         {"text": "❓ Стратегия",          "callback_data": "strategy"}],
+        [{"text": "🔔 Уведомления",        "callback_data": "toggle_notify"},
+         {"text": f"⚡ Режим: {mode}",     "callback_data": "mode_info"}],
     ]
+
+def kb_back():
+    return [[{"text": "🏠 Главное меню", "callback_data": "menu"}]]
 
 def kb_account():
     return [
@@ -614,22 +842,19 @@ def kb_deposit():
 
 def kb_confirm_dep(amount):
     return [
-        [{"text": "✅ Я отправил(а) платёж", "callback_data": f"depsent_{amount}"}],
-        [{"text": "❌ Отмена",               "callback_data": "menu"}],
+        [{"text": "✅ Я отправил платёж", "callback_data": f"depsent_{amount}"}],
+        [{"text": "❌ Отмена",           "callback_data": "menu"}],
     ]
-
-def kb_back():
-    return [[{"text": "🏠 Главное меню", "callback_data": "menu"}]]
 
 def kb_admin():
     return [
-        [{"text": "👥 Пользователи",  "callback_data": "adm_users"},
-         {"text": "📊 Статистика",    "callback_data": "adm_stats"}],
-        [{"text": "💰 Депозиты",      "callback_data": "adm_deposits"},
-         {"text": "💸 Выводы",       "callback_data": "adm_withdrawals"}],
-        [{"text": "📢 Рассылка",      "callback_data": "adm_broadcast"},
-         {"text": "📋 Все сделки",   "callback_data": "adm_trades"}],
-        [{"text": "🏠 Главное меню", "callback_data": "menu"}],
+        [{"text": "👥 Пользователи", "callback_data": "adm_users"},
+         {"text": "📊 Статистика",   "callback_data": "adm_stats"}],
+        [{"text": "💰 Депозиты",     "callback_data": "adm_deposits"},
+         {"text": "💸 Выводы",      "callback_data": "adm_withdrawals"}],
+        [{"text": "📢 Рассылка",     "callback_data": "adm_broadcast"},
+         {"text": "📋 Все сделки",  "callback_data": "adm_trades"}],
+        [{"text": "🏠 Главное меню","callback_data": "menu"}],
     ]
 
 # ─── ЭКРАНЫ ───────────────────────────────────────────────────────────────────
@@ -644,96 +869,114 @@ def screen_main(cid):
         r     = user["real"]
         d_pct = pct_val(d["balance"] - d["start"], d["start"])
         r_pct = pct_val(r["profit"], r["deposited"]) if r["deposited"] > 0 else 0.0
-        ntf   = "🔔 вкл" if user.get("notify", True) else "🔕 выкл"
-        s_real = "✅ Активен" if r["active"] else "⏸ Неактивен"
-        open_p = active_positions()
 
         total_pnl   = sum(s.get("pnl", 0) for s in BOT_STATES.values())
-        total_trade = sum(s.get("n", 0) for s in BOT_STATES.values())
+        total_trade = sum(s.get("n", 0) for s in BOT_STATES.values()) // 2
         total_wins  = sum(s.get("wins", 0) for s in BOT_STATES.values())
         total_loss  = sum(s.get("loss", 0) for s in BOT_STATES.values())
         wr          = wr_calc(total_wins, total_loss)
+        open_p      = active_positions()
+
+        mode_str    = "🟢 <b>LIVE — Bybit Testnet</b>" if LIVE_MODE else "🎮 <b>DEMO (Симуляция)</b>"
+
+        # Реальный баланс с Bybit если LIVE
+        bybit_bal = ""
+        if LIVE_MODE:
+            bal = get_bybit_balance()
+            if bal is not None:
+                bybit_bal = f"\n💳 Bybit USDT: <b>${fmt(bal)}</b>"
 
         text = (
-            "🤖 <b>CryptoBot Pro — ДЕМО РЕЖИМ</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🤖 <b>CryptoBot Pro v5</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⚡ Режим: {mode_str}{bybit_bal}\n"
+            f"📊 Стратегия: EMA21/50 + Supertrend + RSI/MACD\n"
+            f"⏱ Таймфрейм: 4H + 1D фильтр | Плечо: {LEVERAGE}x\n\n"
             f"👋 Привет, <b>{user['name']}</b>!\n\n"
             f"🎮 Демо:     <b>${fmt(d['balance'])}</b>  <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
-            f"💼 Реальный: <b>${fmt(r['balance'])}</b>  <code>{sign(r_pct)}{r_pct:.1f}%</code>\n"
-            f"📌 Статус:   {s_real}\n\n"
+            f"💼 Реальный: <b>${fmt(r['balance'])}</b>  <code>{sign(r_pct)}{r_pct:.1f}%</code>\n\n"
             f"📡 <b>Бот сейчас:</b>\n"
-            f"  Открытых позиций: {open_p}/{MAX_POS}\n"
-            f"  Всего сделок:     {total_trade} (WR: {wr}%)\n"
-            f"  Суммарный P&L:    <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n\n"
-            f"⚡ Стратегия: EMA+Supertrend+RSI+MACD | Bybit API\n"
-            f"🔔 Уведомления: {ntf}"
+            f"  Позиций: {open_p}/{MAX_POS}\n"
+            f"  Сделок:  {total_trade} (WR: {wr}%)\n"
+            f"  P&L:     <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
         )
         send(cid, text, kb_main())
     except Exception as e:
         logger.error("screen_main %s: %s", cid, e)
-        send(cid, "⚠️ Ошибка. Попробуйте: /start")
+        send(cid, "⚠️ Ошибка. /start")
 
 
-def screen_account(cid):
-    user  = get_user(cid)
-    d     = user["demo"]
-    r     = user["real"]
-    d_pct = pct_val(d["balance"] - d["start"], d["start"])
-    r_pct = pct_val(r["profit"], r["deposited"]) if r["deposited"] > 0 else 0.0
-    text  = (
-        "👤 <b>Мой аккаунт</b>\n"
+def screen_strategy(cid):
+    text = (
+        "📈 <b>Стратегия бота v5</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🎮 <b>Демо-счёт</b>\n"
-        f"  Баланс:   <b>${fmt(d['balance'])}</b>\n"
-        f"  Прибыль:  <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
-        f"  Сделок:   {d['trades']}  W:{d['wins']} L:{d['loss']} ({wr_calc(d['wins'],d['loss'])}%)\n\n"
-        "💼 <b>Реальный счёт</b>\n"
-        f"  Внесено:  ${fmt(r['deposited'])}\n"
-        f"  Баланс:   <b>${fmt(r['balance'])}</b>\n"
-        f"  Прибыль:  <code>{sign(r_pct)}{r_pct:.1f}%</code>\n"
-        f"  Сделок:   {r['trades']}  W:{r['wins']} L:{r['loss']} ({wr_calc(r['wins'],r['loss'])}%)\n"
-        f"  Автореинвест: {'✅ вкл' if r.get('autocompound', True) else '❌ выкл'}\n"
-        f"  Статус:   {'✅ Активен' if r['active'] else '⏸ Неактивен'}\n\n"
-        f"🤝 Рефералов: {user.get('ref_count', 0)}  Реф.бонус: ${fmt(user.get('ref_bonus', 0))}\n"
-        f"📅 С нами с: {user['joined']}"
+        "<b>Рынок:</b> USDT Perpetual Futures\n"
+        "<b>Пары:</b> BTC, ETH, SOL\n"
+        f"<b>Плечо:</b> {LEVERAGE}x\n"
+        "<b>Таймфрейм:</b> 4H (сигнал) + 1D (тренд)\n\n"
+        "🟢 <b>ВХОД LONG:</b>\n"
+        "  • EMA21 &gt; EMA50 (восходящий тренд)\n"
+        "  • Supertrend = 🟢 Бычий\n"
+        "  • RSI 40-65 (импульс без перегрева)\n"
+        "  • MACD гист. ≥ 0 и растёт\n"
+        "  • 1D тренд подтверждает\n\n"
+        "🔴 <b>ВХОД SHORT:</b>\n"
+        "  • EMA21 &lt; EMA50 (нисходящий тренд)\n"
+        "  • Supertrend = 🔴 Медвежий\n"
+        "  • RSI 35-60\n"
+        "  • MACD гист. ≤ 0 и падает\n"
+        "  • 1D тренд подтверждает\n\n"
+        "⚙️ <b>Риск-менеджмент:</b>\n"
+        f"  • Риск: {RISK_PCT}% капитала / сделка\n"
+        f"  • SL: ATR × {ATR_SL_MULT}\n"
+        f"  • TP: ATR × {ATR_TP_MULT}  (R:R = 1:2)\n"
+        "  • Трейлинг-стоп при движении\n"
+        f"  • Circuit-breaker: -{DAY_LOSS_PCT}% день / -{GLOBAL_DD}% от пика\n\n"
+        "🎯 <b>Цель:</b> 70-100% годовых при просадке &lt;15%"
     )
-    send(cid, text, kb_account())
+    send(cid, text, kb_back())
 
 
 def screen_stats(cid):
-    trades    = all_trades()
-    sells     = [t for t in trades if t.get("side") == "SELL"]
-    total_n   = len(sells)
-    wins      = [t for t in sells if t.get("pnl", 0) >= 0]
-    losses    = [t for t in sells if t.get("pnl", 0) < 0]
-    total_pnl = sum(t.get("pnl", 0) for t in sells)
-    win_avg   = sum(t["pnl"] for t in wins)   / max(len(wins), 1)
-    loss_avg  = sum(t["pnl"] for t in losses) / max(len(losses), 1)
-    wr        = wr_calc(len(wins), len(losses))
-    rr        = abs(win_avg / loss_avg) if loss_avg != 0 else 0
+    trades  = all_trades()
+    closes  = [t for t in trades if t.get("action") == "CLOSE"]
+    wins    = [t for t in closes if t.get("pnl", 0) >= 0]
+    losses  = [t for t in closes if t.get("pnl", 0) < 0]
+    total_n = len(closes)
+    total_pnl = sum(t.get("pnl", 0) for t in closes)
+    win_avg = sum(t["pnl"] for t in wins)   / max(len(wins), 1)
+    loss_avg= sum(t["pnl"] for t in losses) / max(len(losses), 1)
+    wr      = wr_calc(len(wins), len(losses))
+    rr      = abs(win_avg / loss_avg) if loss_avg != 0 else 0
 
-    pos_text  = ""
+    longs  = [t for t in closes if t.get("side") == "LONG"]
+    shorts = [t for t in closes if t.get("side") == "SHORT"]
+
+    pos_text = ""
     for pair in PAIRS:
         s   = BOT_STATES.get(pair["symbol"], {})
         pos = s.get("pos")
-        if pos:
-            pr = fetch_bybit_price(pair["symbol"]) or pos["entry"]
-            fl = (pr - pos["entry"]) * pos["qty"]
+        if pos and (pr := fetch_price(pair["symbol"])):
+            side = pos["side"]
+            fl   = (pr - pos["entry"]) * pos["qty"] * LEVERAGE
+            if side == "SHORT":
+                fl = -fl
             pos_text += (
-                f"\n{pair['emoji']} {pair['name']}: вход ${fmt(pos['entry'])} | "
+                f"\n{pair['emoji']} {pair['name']} {side}: вход ${fmt(pos['entry'])} | "
                 f"Float: <code>{sign(fl)}${fmt(abs(fl))}</code>"
             )
 
     text = (
-        "📊 <b>Статистика бота (ДЕМО)</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"  Всего сделок:    {total_n}\n"
-        f"  Победных:        {len(wins)} ({wr}%)\n"
-        f"  Убыточных:       {len(losses)}\n"
-        f"  Суммарный P&L:   <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
-        f"  Средний выигрыш: ${fmt(win_avg)}\n"
-        f"  Средний убыток:  ${fmt(abs(loss_avg))}\n"
-        f"  R:R отношение:   {rr:.2f}\n\n"
+        f"📊 <b>Статистика бота</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"  Закрытых сделок:  {total_n}\n"
+        f"  Long / Short:     {len(longs)} / {len(shorts)}\n"
+        f"  Победных:         {len(wins)} ({wr}%)\n"
+        f"  Убыточных:        {len(losses)}\n"
+        f"  Суммарный P&L:    <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
+        f"  Средний выигрыш:  ${fmt(win_avg)}\n"
+        f"  Средний убыток:   ${fmt(abs(loss_avg))}\n"
+        f"  R:R:              {rr:.2f}\n\n"
         "<b>Баланс по парам:</b>\n"
     )
     for pair in PAIRS:
@@ -747,676 +990,584 @@ def screen_stats(cid):
 
 
 def screen_market(cid):
-    text = "🌐 <b>Рынок сейчас (Bybit)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    text = "🌐 <b>Рынок сейчас (Bybit Futures)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     for pair in PAIRS:
-        price = fetch_bybit_price(pair["symbol"])
+        price = fetch_price(pair["symbol"])
         s     = BOT_STATES.get(pair["symbol"], {})
         pos   = s.get("pos")
+        df4h  = fetch_klines(pair["symbol"], "240", 80)
+        sig_txt = ""
+        if df4h is not None and len(df4h) >= 60:
+            df4h   = calc_indicators(df4h)
+            trend  = get_daily_trend(pair["symbol"])
+            sig    = get_signal(df4h, trend)
+            c      = df4h.iloc[-1]
+            rsi_v  = c["rsi"]
+            st_ico = "🟢" if c["st_dir"] == 1 else "🔴"
+            sig_txt = (
+                f"\n  RSI: {rsi_v:.0f} | ST: {st_ico} | "
+                f"EMA: {'📈' if c['ema_mid']>c['ema_slow'] else '📉'}"
+            )
+            if sig:
+                sig_txt += f" | Сигнал: <b>{sig}</b>"
+
         pos_txt = ""
         if pos and price:
-            fl     = (price - pos["entry"]) * pos["qty"]
-            fl_pct = (price - pos["entry"]) / pos["entry"] * 100
+            side = pos["side"]
+            fl   = (price - pos["entry"]) * pos["qty"] * LEVERAGE
+            if side == "SHORT":
+                fl = -fl
+            fl_pct = fl / pos["margin"] * 100 if pos.get("margin") else 0
             pos_txt = (
-                f"\n  📍 Позиция: вход <b>${fmt(pos['entry'])}</b>"
-                f"\n  💰 Float P&L: <code>{sign(fl)}${fmt(abs(fl))} ({sign(fl_pct)}{fl_pct:.1f}%)</code>"
-                f"\n  🛡 Стоп: ${fmt(pos['sl'])} | 🎯 TP: ${fmt(pos['tp'])}"
+                f"\n  📍 {side}: вход <b>${fmt(pos['entry'])}</b>"
+                f"\n  💰 Float: <code>{sign(fl)}${fmt(abs(fl))} ({sign(fl_pct)}{fl_pct:.1f}%)</code>"
+                f"\n  ⛔ SL: ${fmt(pos['sl'])} | 🎯 TP: ${fmt(pos['tp'])}"
             )
+
         price_txt = f"${fmt(price)}" if price else "нет данных"
-        text += f"{pair['emoji']} <b>{pair['name']}</b>  {price_txt}{pos_txt}\n\n"
-    text += "⏱ Анализ каждый час | Данные: Bybit"
+        text += f"{pair['emoji']} <b>{pair['name']}</b>  {price_txt}{sig_txt}{pos_txt}\n\n"
+
+    text += f"⏱ Анализ каждые 4 часа | Плечо {LEVERAGE}x"
     send(cid, text, kb_back())
 
 
 def screen_history(cid):
     trades = all_trades()
-    sells  = [t for t in trades if t.get("side") == "SELL"][-10:]
-    if not sells:
-        send(cid, "📈 <b>Последние сделки</b>\n\nСделок пока нет — бот ищет точку входа...", kb_back())
+    closes = [t for t in trades if t.get("action") == "CLOSE"][-10:]
+    if not closes:
+        send(cid, "📈 <b>Последние сделки</b>\n\nСделок пока нет — бот анализирует рынок...", kb_back())
         return
-    text = "📈 <b>Последние 10 сделок (ДЕМО)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    for t in reversed(sells):
+    text = "📈 <b>Последние 10 сделок</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for t in reversed(closes):
         pnl  = t.get("pnl", 0)
+        side = t.get("side", "?")
         icon = "✅" if pnl >= 0 else "❌"
         text += (
-            f"{icon} <b>{t.get('pair','?')}</b> — {t.get('reason','SIGNAL')}\n"
-            f"  Вход: ${fmt(t.get('entry',0))} → Выход: ${fmt(t.get('price',0))}\n"
-            f"  P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code> | {t.get('time','')}\n\n"
+            f"{icon} <b>{t.get('pair','?')}</b> {side} — {t.get('reason','?')}\n"
+            f"  ${fmt(t.get('entry',0))} → ${fmt(t.get('price',0))}\n"
+            f"  P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code> "
+            f"({sign(t.get('pnl_pct',0))}{t.get('pnl_pct',0):.1f}%)"
+            f" | {t.get('time','')}\n\n"
         )
     send(cid, text, kb_back())
 
 
-def screen_demo(cid):
+def screen_account(cid):
     user  = get_user(cid)
     d     = user["demo"]
-    d_pct = pct_val(d["balance"] - d["start"], d["start"])
-    text  = (
-        "🎮 <b>Демо-счёт</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"  Стартовый: $1,000.00\n"
-        f"  Текущий:   <b>${fmt(d['balance'])}</b>\n"
-        f"  Прибыль:   <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
-        f"  Сделок:    {d['trades']} (WR: {wr_calc(d['wins'],d['loss'])}%)\n"
-    )
-    send(cid, text, kb_back())
-
-
-def screen_real(cid):
-    user  = get_user(cid)
     r     = user["real"]
+    d_pct = pct_val(d["balance"] - d["start"], d["start"])
     r_pct = pct_val(r["profit"], r["deposited"]) if r["deposited"] > 0 else 0.0
     text  = (
-        "💼 <b>Реальный счёт</b>\n"
+        "👤 <b>Мой аккаунт</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"  Внесено:    <b>${fmt(r['deposited'])}</b>\n"
-        f"  Баланс:     <b>${fmt(r['balance'])}</b>\n"
-        f"  Прибыль:    <code>{sign(r_pct)}{r_pct:.1f}%</code>\n"
-        f"  Сделок:     {r['trades']} (WR: {wr_calc(r['wins'],r['loss'])}%)\n"
-        f"  Автореинвест: {'✅ вкл' if r.get('autocompound', True) else '❌ выкл'}\n"
-        f"  Статус:     {'✅ Активен' if r['active'] else '⏸ Неактивен'}\n\n"
-        "💡 Пополните счёт, чтобы бот торговал за вас!"
+        "🎮 <b>Демо-счёт</b>\n"
+        f"  Баланс:  <b>${fmt(d['balance'])}</b>\n"
+        f"  Прибыль: <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
+        f"  Сделок:  {d['trades']} (WR: {wr_calc(d['wins'],d['loss'])}%)\n\n"
+        "💼 <b>Реальный счёт</b>\n"
+        f"  Внесено:  ${fmt(r['deposited'])}\n"
+        f"  Баланс:   <b>${fmt(r['balance'])}</b>\n"
+        f"  Прибыль:  <code>{sign(r_pct)}{r_pct:.1f}%</code>\n"
+        f"  Сделок:   {r['trades']} (WR: {wr_calc(r['wins'],r['loss'])}%)\n"
+        f"  Реинвест: {'✅' if r.get('autocompound', True) else '❌'}\n"
+        f"  Статус:   {'✅ Активен' if r['active'] else '⏸ Неактивен'}\n\n"
+        f"🤝 Рефералов: {user.get('ref_count',0)} | Реф.бонус: ${fmt(user.get('ref_bonus',0))}\n"
+        f"📅 С нами с: {user['joined']}"
     )
     send(cid, text, kb_account())
 
 
 def screen_deposit(cid):
-    send(cid,
-         "💰 <b>Пополнение счёта</b>\n\n"
-         "Выберите сумму или введите свою:\n"
-         "(Минимум $50 USDT TRC-20)",
-         kb_deposit())
-
-
-def screen_confirm_dep(cid, amount):
-    STATES[str(cid)] = "await_txid"
-    send(cid,
-         f"💰 <b>Пополнение на ${amount}</b>\n\n"
-         f"Отправьте <b>{amount} USDT</b> (TRC-20) на адрес:\n\n"
-         f"<code>{WALLET}</code>\n\n"
-         f"После отправки нажмите кнопку ниже:",
-         kb_confirm_dep(amount))
-
-
-def screen_deposit_sent(cid, amount):
-    STATES[str(cid)] = f"txid_{amount}"
-    send(cid, "🔍 Введите TxID транзакции для подтверждения:", kb_back())
-
-
-def screen_withdraw(cid):
-    user = get_user(cid)
-    r    = user["real"]
-    if r["balance"] < 10:
-        send(cid, "❌ Минимальный баланс для вывода: $10", kb_back())
-        return
-    STATES[str(cid)] = "await_withdraw"
-    send(cid,
-         f"💸 <b>Вывод средств</b>\n\n"
-         f"Доступно: <b>${fmt(r['balance'])}</b>\n\n"
-         f"Введите сумму для вывода (мин. $10):",
-         kb_back())
+    text = (
+        f"💰 <b>Пополнение счёта</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Кошелёк USDT (TRC-20):\n"
+        f"<code>{WALLET}</code>\n\n"
+        f"После отправки нажмите кнопку подтверждения.\n"
+        f"Минимум: $50 | Зачисление: 10-30 мин"
+    )
+    send(cid, text, kb_deposit())
 
 
 def screen_referral(cid):
     user = get_user(cid)
     code = user.get("ref_code", _gen_ref())
-    refs = load_refs()
-    refs[code] = str(cid)
-    save_refs(refs)
     text = (
         "🤝 <b>Реферальная программа</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Приглашайте друзей и получайте <b>5%</b> от их прибыли!\n\n"
-        f"👥 Приглашено: {user.get('ref_count', 0)}\n"
-        f"💰 Ваш бонус:  ${fmt(user.get('ref_bonus', 0))}\n\n"
-        f"🔗 Ваш реф-код: <code>{code}</code>\n\n"
-        "Отправьте этот код другу — он введёт его при старте!"
+        "За каждого приглашённого: <b>5% от его прибыли</b>\n\n"
+        f"Ваш код: <code>{code}</code>\n"
+        f"Рефералов: {user.get('ref_count', 0)}\n"
+        f"Заработано: <b>${fmt(user.get('ref_bonus', 0))}</b>\n\n"
+        f"Ссылка для приглашения:\n"
+        f"<code>https://t.me/ваш_бот?start={code}</code>"
     )
     send(cid, text, kb_back())
 
 
-def screen_help(cid):
-    send(cid,
-         "❓ <b>Как работает CryptoBot Pro?</b>\n"
-         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-         "🔬 <b>Стратегия (проверена на реальном рынке):</b>\n"
-         "Бот анализирует BTC, ETH, SOL каждый час,\n"
-         "используя профессиональные индикаторы:\n"
-         "  • EMA (9/21/50) — тренд\n"
-         "  • Supertrend — сила направления\n"
-         "  • RSI (14) — перекупленность\n"
-         "  • MACD — разворот тренда\n"
-         "  • Объём — подтверждение входа\n"
-         "  • 4H таймфрейм — фильтр мажора\n\n"
-         "📊 <b>Риск-менеджмент:</b>\n"
-         "  • 2% капитала на каждую сделку\n"
-         "  • Стоп-лосс: ATR × 1.5\n"
-         "  • Тейк-профит: ATR × 3 (R:R = 1:2)\n"
-         "  • Trailing stop — защита прибыли\n"
-         "  • Circuit-breaker при -7% за день\n"
-         "  • Глобальная защита при -18% от пика\n\n"
-         "🎯 <b>Цель: 70-100% годовых</b>\n"
-         "📡 <b>Данные: Bybit Real-Time API</b>\n\n"
-         "💰 Пополните реальный счёт и начните зарабатывать!",
-         kb_back())
+def screen_mode_info(cid):
+    if LIVE_MODE:
+        bal = get_bybit_balance()
+        text = (
+            "🟢 <b>Режим: LIVE (Bybit Testnet)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Бот торгует на реальном Bybit через API!\n\n"
+            f"💳 Баланс USDT: <b>${fmt(bal) if bal else 'нет данных'}</b>\n"
+            f"🔑 API ключ: ...{BYBIT_KEY[-4:] if BYBIT_KEY else 'не задан'}\n"
+            f"🌐 Сеть: {'Testnet' if USE_TESTNET else 'Mainnet'}\n"
+            f"📊 Плечо: {LEVERAGE}x"
+        )
+    else:
+        text = (
+            "🎮 <b>Режим: DEMO (Симуляция)</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Бот работает в режиме симуляции.\n"
+            "Реальные котировки Bybit, виртуальные сделки.\n\n"
+            "Чтобы включить реальную торговлю:\n"
+            "1. Зарегистрируйтесь на Bybit Testnet\n"
+            "2. Создайте API ключ\n"
+            "3. Добавьте BYBIT_API_KEY и BYBIT_API_SECRET\n"
+            "4. Перезапустите бота"
+        )
+    send(cid, text, kb_back())
 
 
 def screen_leaderboard(cid):
-    users = load_users()
-    rows  = []
-    for uid, u in users.items():
-        r = u["real"]
-        if r["deposited"] > 0:
-            p = pct_val(r["profit"], r["deposited"])
-            rows.append((uid, u.get("name") or "Инвестор", p, r["balance"]))
-    rows.sort(key=lambda x: x[2], reverse=True)
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    text   = "🏆 <b>Лидерборд</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    if not rows:
-        text += "Пока нет активных инвесторов"
-    else:
-        for i, (uid, name, p, bal) in enumerate(rows[:10]):
-            med = medals[i] if i < 5 else f"{i+1}."
-            me  = " ← вы" if uid == str(cid) else ""
-            text += f"{med} <b>{name}</b>  {sign(p)}{p:.1f}%  (${fmt(bal)}){me}\n"
+    users  = load_users()
+    actives = [(uid, u) for uid, u in users.items()
+               if u["real"]["deposited"] > 0 or u["demo"]["trades"] > 0]
+    actives.sort(key=lambda x: x[1]["real"]["profit"] + x[1]["demo"]["balance"] - 1000, reverse=True)
+    text = "🏆 <b>Лидерборд</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (uid, u) in enumerate(actives[:10]):
+        m    = medals[i] if i < 3 else f"{i+1}."
+        pnl  = u["real"]["profit"] + (u["demo"]["balance"] - 1000)
+        name = u.get("name") or f"Инвестор{uid[-4:]}"
+        text += f"{m} <b>{name}</b> — <code>{sign(pnl)}${fmt(abs(pnl))}</code>\n"
+    if not actives:
+        text += "Пока никого нет. Будь первым! 🚀"
     send(cid, text, kb_back())
 
+# ─── ADMIN ЭКРАНЫ ─────────────────────────────────────────────────────────────
 
-def screen_my_stats(cid):
-    user = get_user(cid)
-    d    = user["demo"]
-    r    = user["real"]
+def screen_admin(cid):
+    users      = load_users()
+    total_dep  = sum(u["real"]["deposited"] for u in users.values() if u["real"]["active"])
+    total_users= len(users)
+    trades     = all_trades()
+    closes     = [t for t in trades if t.get("action") == "CLOSE"]
+    total_pnl  = sum(t.get("pnl", 0) for t in closes)
+    mode_lbl   = "🟢 LIVE Bybit" if LIVE_MODE else "🎮 DEMO"
+
     text = (
-        "📊 <b>Моя статистика</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🎮 <b>Демо-счёт</b>\n"
-        f"  Winrate:  {wr_calc(d['wins'], d['loss'])}%\n"
-        f"  Просадка: {d.get('max_dd', 0):.1f}%\n"
-        f"  Сделок:   {d['trades']}\n\n"
-        "💼 <b>Реальный счёт</b>\n"
-        f"  Winrate:  {wr_calc(r['wins'], r['loss'])}%\n"
-        f"  Просадка: {r.get('max_dd', 0):.1f}%\n"
-        f"  Сделок:   {r['trades']}\n"
-        f"  Прибыль:  ${fmt(r['profit'])}\n\n"
-        f"📅 С нами с: {user['joined']}"
-    )
-    send(cid, text, kb_back())
-
-# ─── ADMIN ────────────────────────────────────────────────────────────────────
-
-def screen_adm_users(cid):
-    users     = load_users()
-    active    = sum(1 for u in users.values() if u["real"]["active"])
-    total_dep = sum(u["real"]["deposited"] for u in users.values())
-    total_prf = sum(u["real"]["profit"] for u in users.values())
-    text      = (
-        "👥 <b>Пользователи</b>\n"
-        f"  Всего:         {len(users)}\n"
-        f"  Активных:      {active}\n"
-        f"  Сумма депо:    ${fmt(total_dep)}\n"
-        f"  Сумма прибыли: ${fmt(total_prf)}"
+        f"🛠 <b>Админ-панель</b> [{mode_lbl}]\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"💰 Всего внесено: ${fmt(total_dep)}\n"
+        f"📊 Сделок закрыто: {len(closes)}\n"
+        f"💹 Суммарный P&L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
+        f"📌 Открытых позиций: {active_positions()}/{MAX_POS}"
     )
     send(cid, text, kb_admin())
 
+# ─── ОБРАБОТКА КОМАНД ─────────────────────────────────────────────────────────
 
-def screen_adm_stats(cid):
-    trades    = all_trades()
-    sells     = [t for t in trades if t.get("side") == "SELL"]
-    wins      = sum(1 for t in sells if t.get("pnl", 0) >= 0)
-    total_pnl = sum(t.get("pnl", 0) for t in sells)
-    text      = (
-        "📊 <b>Статистика бота</b>\n"
-        f"  Сделок:    {len(sells)}\n"
-        f"  Побед:     {wins} ({wr_calc(wins, max(len(sells)-wins,0))}%)\n"
-        f"  Общий P&L: {sign(total_pnl)}${fmt(abs(total_pnl))}\n\n"
-        "<b>По парам:</b>\n"
-    )
-    for pair in PAIRS:
-        s    = BOT_STATES.get(pair["symbol"], {})
-        text += f"  {pair['emoji']} {pair['name']}: ${fmt(s.get('usdt', 10000))}  ({s.get('wins',0)}W/{s.get('loss',0)}L)\n"
-    send(cid, text, kb_admin())
+PENDING_INPUTS = {}
 
 
-def screen_adm_deposits(cid):
-    users = load_users()
-    rows  = [(u.get("name","?"), u["real"]["deposited"]) for u in users.values() if u["real"]["deposited"] > 0]
-    rows.sort(key=lambda x: x[1], reverse=True)
-    text  = "💰 <b>Депозиты</b>\n"
-    for name, dep in rows[:15]:
-        text += f"  {name}: ${fmt(dep)}\n"
-    if not rows:
-        text += "Нет депозитов"
-    send(cid, text, kb_admin())
+def process_update(update):
+    msg = update.get("message", {})
+    cb  = update.get("callback_query", {})
 
+    if msg:
+        cid  = str(msg["chat"]["id"])
+        text = msg.get("text", "")
+        name = msg.get("from", {}).get("first_name", "")
 
-def screen_adm_withdrawals(cid):
-    users = load_users()
-    rows  = []
-    for u in users.values():
-        for w in u["real"].get("withdrawals", []):
-            rows.append((u.get("name","?"), w))
-    rows.sort(key=lambda x: x[1].get("time",""), reverse=True)
-    text = "💸 <b>Выводы</b>\n"
-    for name, w in rows[:15]:
-        text += f"  {name}: ${fmt(w.get('amount',0))} — {w.get('status','?')} {w.get('time','')}\n"
-    if not rows:
-        text += "Нет запросов"
-    send(cid, text, kb_admin())
-
-
-def screen_adm_trades(cid):
-    trades = all_trades()
-    sells  = [t for t in trades if t.get("side") == "SELL"][-15:]
-    text   = "📋 <b>Последние сделки</b>\n"
-    for t in reversed(sells):
-        pnl  = t.get("pnl", 0)
-        icon = "✅" if pnl >= 0 else "❌"
-        text += f"{icon} {t.get('pair','?')} | {sign(pnl)}${fmt(abs(pnl))} | {t.get('reason','?')} | {t.get('time','')}\n"
-    if not sells:
-        text += "Сделок пока нет"
-    send(cid, text, kb_admin())
-
-
-STATES = {}
-
-def adm_broadcast(cid):
-    STATES[str(cid)] = "broadcast"
-    send(cid, "📢 Введите текст для рассылки:", kb_back())
-
-
-def do_broadcast(text):
-    users = load_users()
-    ok = fail = 0
-    for uid in users:
-        res = send(uid, "📢 <b>Сообщение от CryptoBot Pro:</b>\n\n" + text)
-        if res.get("ok"):
-            ok += 1
-        else:
-            fail += 1
-        time.sleep(0.1)
-    send(ADMIN_ID, f"📢 Рассылка: {ok} доставлено, {fail} ошибок")
-
-
-def weekly_report():
-    users     = load_users()
-    trades    = all_trades()
-    sells     = [t for t in trades if t.get("side") == "SELL"]
-    wins      = sum(1 for t in sells if t.get("pnl", 0) >= 0)
-    total_pnl = sum(t.get("pnl", 0) for t in sells)
-    msg = (
-        "📊 <b>Еженедельный отчёт</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Сделок за период: {len(sells)}\n"
-        f"Winrate: {wr_calc(wins, max(len(sells)-wins,0))}%\n"
-        f"P&L бота: {sign(total_pnl)}${fmt(abs(total_pnl))}\n\n"
-        "Бот продолжает работу 24/7. Удачи! 🚀"
-    )
-    for uid, u in users.items():
-        if u.get("notify", True):
-            send(uid, msg)
-            time.sleep(0.05)
-
-# ─── ОБРАБОТКА СООБЩЕНИЙ ──────────────────────────────────────────────────────
-
-def load_refs():
-    if REFS_FILE.exists():
-        try:
-            with open(REFS_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def save_refs(r):
-    with open(REFS_FILE, "w", encoding="utf-8") as f:
-        json.dump(r, f, indent=2, ensure_ascii=False, default=str)
-
-
-def handle_message(msg):
-    cid  = str(msg.get("chat", {}).get("id", ""))
-    text = msg.get("text", "").strip()
-    name = msg.get("from", {}).get("first_name", "")
-    if not cid:
-        return
-
-    user = get_user(cid)
-    if name and user.get("name") != name:
-        user["name"] = name
-        save_user(cid, user)
-
-    if text.startswith("/start ref_"):
-        ref_code = text.split("ref_")[1].strip()
-        refs     = load_refs()
-        if ref_code in refs and not user.get("ref_by"):
-            referrer_id = refs[ref_code]
-            user["ref_by"] = referrer_id
-            save_user(cid, user)
-            referrer = get_user(referrer_id)
-            referrer["ref_count"] = referrer.get("ref_count", 0) + 1
-            save_user(referrer_id, referrer)
-            send(referrer_id, f"🎉 Новый реферал! {name} присоединился!")
-        screen_main(cid)
-        return
-
-    if text in ("/start", "/menu"):
-        screen_main(cid)
-        return
-
-    if text == "/admin" and is_admin(cid):
-        send(cid, "🔑 <b>Панель администратора</b>", kb_admin())
-        return
-
-    state = STATES.get(cid, "")
-
-    if state == "broadcast" and is_admin(cid):
-        STATES.pop(cid, None)
-        do_broadcast(text)
-        return
-
-    if state.startswith("txid_"):
-        amount = float(state.split("_")[1])
-        txid   = text.strip()
-        STATES.pop(cid, None)
-        r = user["real"]
-        r["pending"]      = amount
-        r["pending_txid"] = txid
-        user["real"] = r
-        save_user(cid, user)
-        send(cid,
-             f"✅ Запрос на пополнение ${fmt(amount)} получен!\n"
-             f"TxID: <code>{txid}</code>\n\nОжидайте подтверждения (~30 мин).",
-             kb_back())
-        send(ADMIN_ID,
-             f"💰 <b>Запрос на пополнение</b>\n"
-             f"Пользователь: {name} ({cid})\n"
-             f"Сумма: ${fmt(amount)}\n"
-             f"TxID: <code>{txid}</code>\n"
-             f"Команда: /confirm_{cid}_{amount}")
-        return
-
-    if state == "await_withdraw":
-        STATES.pop(cid, None)
-        try:
-            amount = float(text.replace("$", "").replace(",", ".").strip())
-        except ValueError:
-            send(cid, "❌ Неверная сумма", kb_back())
-            return
-        r = user["real"]
-        if amount < 10 or amount > r["balance"]:
-            send(cid, f"❌ Сумма: от $10 до ${fmt(r['balance'])}", kb_back())
-            return
-        STATES[cid] = f"withdraw_addr_{amount}"
-        send(cid, f"💸 Вывод ${fmt(amount)}\n\nВведите ваш USDT TRC-20 адрес:")
-        return
-
-    if state.startswith("withdraw_addr_"):
-        amount = float(state.split("_")[-1])
-        addr   = text.strip()
-        STATES.pop(cid, None)
-        r = user["real"]
-        r["balance"] -= amount
-        r["withdrawals"].append({
-            "amount": amount, "addr": addr,
-            "status": "⏳ Ожидает", "time": ts()
-        })
-        user["real"] = r
-        save_user(cid, user)
-        send(cid,
-             f"✅ Запрос на вывод ${fmt(amount)} создан!\n"
-             f"Адрес: <code>{addr}</code>\n\nОбработка в течение 24ч.",
-             kb_back())
-        send(ADMIN_ID,
-             f"💸 <b>Запрос на вывод</b>\n"
-             f"Пользователь: {name} ({cid})\n"
-             f"Сумма: ${fmt(amount)}\n"
-             f"Адрес: <code>{addr}</code>\n"
-             f"Команда: /pay_{cid}_{amount}")
-        return
-
-    if state == "dep_custom":
-        STATES.pop(cid, None)
-        try:
-            amount = float(text.replace("$", "").replace(",", ".").strip())
-        except ValueError:
-            send(cid, "❌ Введите сумму числом", kb_back())
-            return
-        if amount < 50:
-            send(cid, "❌ Минимум: $50", kb_back())
-            return
-        screen_confirm_dep(cid, amount)
-        return
-
-    if is_admin(cid):
-        if text.startswith("/confirm_"):
-            parts = text.split("_")
-            if len(parts) >= 3:
-                target_id = parts[1]
-                amount    = float(parts[2])
-                target    = get_user(target_id)
-                r         = target["real"]
-                r["balance"]   += amount
-                r["deposited"] += amount
-                r["active"]     = True
-                r["pending"]    = 0
-                if r["balance"] > r.get("peak", 0):
-                    r["peak"] = r["balance"]
-                target["real"] = r
-                save_user(target_id, target)
-                send(target_id, f"✅ Счёт пополнен на ${fmt(amount)}!\nБаланс: ${fmt(r['balance'])}")
-                send(cid, f"✅ Подтверждено для {target_id}")
-            return
-
-        if text.startswith("/pay_"):
-            parts = text.split("_")
-            if len(parts) >= 3:
-                target_id = parts[1]
-                amount    = float(parts[2])
-                target    = get_user(target_id)
-                r         = target["real"]
-                for w in r["withdrawals"]:
-                    if w.get("status") == "⏳ Ожидает" and abs(w.get("amount", 0) - amount) < 0.01:
-                        w["status"] = "✅ Выплачено"
-                        break
-                target["real"] = r
-                save_user(target_id, target)
-                send(target_id, f"✅ Вывод ${fmt(amount)} выплачен!")
-                send(cid, f"✅ Выплата подтверждена для {target_id}")
-            return
-
-    screen_main(cid)
-
-
-def handle_callback(cb):
-    cid   = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-    data  = cb.get("data", "")
-    cb_id = cb.get("id", "")
-    if not cid:
-        return
-    answer_cb(cb_id)
-
-    routes = {
-        "menu":         screen_main,
-        "account":      screen_account,
-        "stats":        screen_stats,
-        "market":       screen_market,
-        "history":      screen_history,
-        "demo":         screen_demo,
-        "real":         screen_real,
-        "deposit":      screen_deposit,
-        "withdraw":     screen_withdraw,
-        "referral":     screen_referral,
-        "help":         screen_help,
-        "leaderboard":  screen_leaderboard,
-        "my_stats":     screen_my_stats,
-    }
-
-    if data in routes:
-        routes[data](cid)
-    elif data == "toggle_notify":
         user = get_user(cid)
-        user["notify"] = not user.get("notify", True)
-        save_user(cid, user)
-        send(cid, f"🔔 Уведомления {'включены' if user['notify'] else 'выключены'}", kb_back())
-    elif data.startswith("dep_"):
-        val = data[4:]
-        if val == "custom":
-            STATES[cid] = "dep_custom"
-            send(cid, "✏️ Введите сумму в USDT (минимум $50):", kb_back())
+        if name and not user.get("name"):
+            user["name"] = name
+            save_user(cid, user)
+
+        # Реферальный ввод
+        if cid in PENDING_INPUTS:
+            mode = PENDING_INPUTS.pop(cid)
+            if mode == "ref_code":
+                users = load_users()
+                ref_uid = next((u for u, v in users.items() if v.get("ref_code") == text.strip()), None)
+                if ref_uid and ref_uid != cid:
+                    user = get_user(cid)
+                    if not user.get("ref_by"):
+                        user["ref_by"] = ref_uid
+                        save_user(cid, user)
+                        ref_user = users[ref_uid]
+                        ref_user["ref_count"] = ref_user.get("ref_count", 0) + 1
+                        save_user(ref_uid, ref_user)
+                        send(cid, "✅ Реферальный код принят!")
+                    else:
+                        send(cid, "❌ Вы уже использовали реферальный код")
+                else:
+                    send(cid, "❌ Код не найден")
+                return
+            elif mode.startswith("dep_custom"):
+                try:
+                    amount = float(text.strip().replace("$",""))
+                    if amount < 50:
+                        send(cid, "❌ Минимальная сумма $50")
+                        return
+                    send(cid,
+                         f"💳 Переведите <b>${fmt(amount)}</b> USDT (TRC-20):\n"
+                         f"<code>{WALLET}</code>",
+                         kb_confirm_dep(amount))
+                except Exception:
+                    send(cid, "❌ Введите корректную сумму")
+                return
+            elif mode.startswith("broadcast"):
+                users = load_users()
+                count = 0
+                for uid in users:
+                    try:
+                        send(uid, f"📢 <b>Сообщение от администратора:</b>\n\n{text}")
+                        count += 1
+                    except Exception:
+                        pass
+                send(cid, f"✅ Рассылка отправлена {count} пользователям")
+                return
+
+        if text.startswith("/start"):
+            parts = text.split()
+            if len(parts) > 1:
+                ref = parts[1]
+                users = load_users()
+                ref_uid = next((u for u, v in users.items() if v.get("ref_code") == ref), None)
+                if ref_uid and ref_uid != cid:
+                    user = get_user(cid)
+                    if not user.get("ref_by"):
+                        user["ref_by"] = ref_uid
+                        save_user(cid, user)
+                        ref_user = get_user(ref_uid)
+                        ref_user["ref_count"] = ref_user.get("ref_count", 0) + 1
+                        save_user(ref_uid, ref_user)
+            screen_main(cid)
+        elif text == "/stats":
+            screen_stats(cid)
+        elif text == "/market":
+            screen_market(cid)
+        elif text == "/admin" and is_admin(cid):
+            screen_admin(cid)
+        elif text == "/strategy":
+            screen_strategy(cid)
         else:
-            screen_confirm_dep(cid, int(val))
-    elif data.startswith("depsent_"):
-        amount = float(data.split("_")[1])
-        screen_deposit_sent(cid, amount)
-    elif data == "adm_users"       and is_admin(cid): screen_adm_users(cid)
-    elif data == "adm_stats"       and is_admin(cid): screen_adm_stats(cid)
-    elif data == "adm_deposits"    and is_admin(cid): screen_adm_deposits(cid)
-    elif data == "adm_withdrawals" and is_admin(cid): screen_adm_withdrawals(cid)
-    elif data == "adm_trades"      and is_admin(cid): screen_adm_trades(cid)
-    elif data == "adm_broadcast"   and is_admin(cid): adm_broadcast(cid)
+            screen_main(cid)
 
-# ─── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
+    elif cb:
+        cid   = str(cb["from"]["id"])
+        data  = cb.get("data", "")
+        cb_id = cb["id"]
+        answer_cb(cb_id)
 
-LAST_UPD_ID = 0
+        # Депозиты
+        if data.startswith("dep_") and data != "dep_custom":
+            amount = int(data.split("_")[1])
+            send(cid,
+                 f"💳 Переведите <b>${fmt(amount)}</b> USDT (TRC-20):\n"
+                 f"<code>{WALLET}</code>",
+                 kb_confirm_dep(amount))
+        elif data == "dep_custom":
+            PENDING_INPUTS[cid] = "dep_custom"
+            send(cid, "✏️ Введите сумму пополнения (минимум $50):", kb_back())
+        elif data.startswith("depsent_"):
+            amount = float(data.split("_")[1])
+            if is_admin(cid):
+                user = get_user(cid)
+                user["real"]["deposited"] += amount
+                user["real"]["balance"]   += amount
+                user["real"]["active"]     = True
+                if user["real"]["balance"] > user["real"].get("peak", 0):
+                    user["real"]["peak"] = user["real"]["balance"]
+                save_user(cid, user)
+                send(cid, f"✅ Баланс пополнен на <b>${fmt(amount)}</b>!\n"
+                          f"Текущий баланс: <b>${fmt(user['real']['balance'])}</b>")
+            else:
+                send(ADMIN_ID,
+                     f"💰 <b>НОВЫЙ ДЕПОЗИТ</b>\n"
+                     f"Пользователь: {cid} ({cb['from'].get('username','?')})\n"
+                     f"Сумма: <b>${fmt(amount)}</b>\n"
+                     f"Подтвердите: /confirm_{cid}_{amount}")
+                send(cid, "⏳ Заявка отправлена администратору. Ожидайте подтверждения (10-30 мин)")
+        elif data.startswith("withdraw"):
+            user = get_user(cid)
+            bal  = user["real"]["balance"]
+            send(cid,
+                 f"💸 <b>Вывод средств</b>\n\n"
+                 f"Доступно: <b>${fmt(bal)}</b>\n"
+                 f"Для вывода напишите: /withdraw [сумма] [адрес]\n"
+                 f"Минимум $10 | Комиссия 1%",
+                 kb_back())
+        elif data == "menu":
+            screen_main(cid)
+        elif data == "account":
+            screen_account(cid)
+        elif data == "stats":
+            screen_stats(cid)
+        elif data == "market":
+            screen_market(cid)
+        elif data == "history":
+            screen_history(cid)
+        elif data == "deposit":
+            screen_deposit(cid)
+        elif data == "referral":
+            screen_referral(cid)
+        elif data == "strategy":
+            screen_strategy(cid)
+        elif data == "mode_info":
+            screen_mode_info(cid)
+        elif data == "leaderboard":
+            screen_leaderboard(cid)
+        elif data == "demo":
+            user = get_user(cid)
+            d    = user["demo"]
+            pct  = pct_val(d["balance"] - d["start"], d["start"])
+            send(cid,
+                 f"🎮 <b>Демо-счёт</b>\n"
+                 f"Стартовый: $1,000\n"
+                 f"Текущий:   <b>${fmt(d['balance'])}</b>\n"
+                 f"Прибыль:   <code>{sign(pct)}{pct:.1f}%</code>\n"
+                 f"Сделок:    {d['trades']} (WR: {wr_calc(d['wins'],d['loss'])}%)", kb_back())
+        elif data == "real":
+            user = get_user(cid)
+            r    = user["real"]
+            pct  = pct_val(r["profit"], r["deposited"]) if r["deposited"] > 0 else 0.0
+            send(cid,
+                 f"💼 <b>Реальный счёт</b>\n"
+                 f"Внесено:  ${fmt(r['deposited'])}\n"
+                 f"Баланс:   <b>${fmt(r['balance'])}</b>\n"
+                 f"Прибыль:  <code>{sign(pct)}{pct:.1f}%</code>\n"
+                 f"Сделок:   {r['trades']}", kb_back())
+        elif data == "my_stats":
+            user = get_user(cid)
+            d    = user["demo"]
+            r    = user["real"]
+            send(cid,
+                 f"📊 <b>Моя статистика</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"🎮 Демо-сделок: {d['trades']} | WR: {wr_calc(d['wins'],d['loss'])}%\n"
+                 f"💼 Реал-сделок: {r['trades']} | WR: {wr_calc(r['wins'],r['loss'])}%\n"
+                 f"🤝 Рефералов:  {user.get('ref_count',0)}\n"
+                 f"💎 Реф.бонус:  ${fmt(user.get('ref_bonus',0))}", kb_back())
+        elif data == "toggle_notify":
+            user = get_user(cid)
+            user["notify"] = not user.get("notify", True)
+            save_user(cid, user)
+            state = "включены 🔔" if user["notify"] else "выключены 🔕"
+            send(cid, f"Уведомления {state}", kb_back())
+        elif data.startswith("adm_") and is_admin(cid):
+            handle_admin_cb(cid, data)
 
 
-def poll_telegram():
-    global LAST_UPD_ID
-    res = api("getUpdates", {"offset": LAST_UPD_ID + 1, "timeout": 25, "limit": 50})
-    if not res.get("ok"):
-        return
-    for upd in res.get("result", []):
-        LAST_UPD_ID = upd["update_id"]
-        if "message" in upd:
-            handle_message(upd["message"])
-        elif "callback_query" in upd:
-            handle_callback(upd["callback_query"])
+def handle_admin_cb(cid, data):
+    if data == "adm_users":
+        users = load_users()
+        text  = f"👥 <b>Пользователи ({len(users)})</b>\n\n"
+        for uid, u in list(users.items())[:15]:
+            r = u["real"]
+            text += f"• {uid} | Деп: ${fmt(r['deposited'])} | {'✅' if r['active'] else '⏸'}\n"
+        send(cid, text, kb_back())
+    elif data == "adm_stats":
+        screen_admin(cid)
+    elif data == "adm_deposits":
+        users  = load_users()
+        total  = sum(u["real"]["deposited"] for u in users.values())
+        active = sum(1 for u in users.values() if u["real"]["active"])
+        send(cid, f"💰 Депозиты\nВсего внесено: ${fmt(total)}\nАктивных: {active}", kb_back())
+    elif data == "adm_trades":
+        trades = all_trades()
+        closes = [t for t in trades if t.get("action") == "CLOSE"][-10:]
+        text   = "📋 <b>Последние сделки</b>\n\n"
+        for t in reversed(closes):
+            pnl  = t.get("pnl", 0)
+            icon = "✅" if pnl >= 0 else "❌"
+            text += f"{icon} {t.get('pair')} {t.get('side')} {sign(pnl)}${fmt(abs(pnl))}\n"
+        send(cid, text or "Нет сделок", kb_back())
+    elif data == "adm_broadcast":
+        PENDING_INPUTS[cid] = "broadcast"
+        send(cid, "✏️ Введите текст рассылки:", kb_back())
 
+# ─── ГЛАВНЫЙ ТОРГОВЫЙ ЦИКЛ ────────────────────────────────────────────────────
 
-def run():
-    global BOT_STATES
+def trading_loop():
+    """Основной цикл торговли — анализирует рынок каждые 4 часа"""
     logger.info("=" * 60)
-    logger.info("CryptoBot Pro v4 — СТАРТ")
-    logger.info("Стратегия: EMA+Supertrend+RSI+MACD | Данные: Bybit API")
+    logger.info("CryptoBot Pro v5 — Торговый цикл запущен")
+    logger.info(f"Режим:     {'LIVE (Bybit)' if LIVE_MODE else 'DEMO (Симуляция)'}")
+    logger.info(f"Testnet:   {USE_TESTNET}")
+    logger.info(f"Плечо:     {LEVERAGE}x")
+    logger.info(f"Пар:       {len(PAIRS)}")
     logger.info("=" * 60)
 
-    if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN не задан!")
-        sys.exit(1)
-
+    # Инициализируем состояния
     for pair in PAIRS:
         BOT_STATES[pair["symbol"]] = load_bot_state(pair["symbol"])
 
-    send(ADMIN_ID,
-         "🚀 <b>CryptoBot Pro v4 ЗАПУЩЕН</b>\n"
-         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-         "📊 Стратегия: EMA + Supertrend + RSI + MACD\n"
-         "📡 Данные: Bybit Real-Time API\n"
-         "⏱ Анализ: каждые 60 минут\n"
-         "🎯 Цель: 70-100% годовых\n"
-         "💼 Режим: ДЕМО (реальные цены, виртуальные сделки)\n\n"
-         "Бот начинает анализировать рынок...\n"
-         "/start — открыть меню")
-
-    last_trade_check = 0
-    last_report      = time.time()
-    check_num        = 0
-
-    logger.info("Telegram polling активен.")
+    last_trade = 0
+    last_report= 0
+    check_num  = 0
 
     while True:
         try:
-            poll_telegram()
-
             now = time.time()
-            if now - last_trade_check >= TRADE_INT:
-                last_trade_check = now
-                check_num       += 1
-                logger.info("─── Торговый цикл #%d ───", check_num)
+
+            # Торговый анализ каждые 4 часа
+            if now - last_trade >= TRADE_INT:
+                last_trade = now
+                check_num += 1
+                logger.info("🔍 Анализ рынка #%d...", check_num)
 
                 for pair in PAIRS:
+                    sym = pair["symbol"]
                     try:
-                        sym = pair["symbol"]
                         if circuit_breaker(sym):
                             continue
 
-                        df = fetch_bybit_klines(sym, interval="60", limit=200)
-                        if df is None or len(df) < 60:
-                            logger.warning("%s: мало данных", sym)
-                            continue
-
-                        df    = calc_indicators(df)
-                        price = fetch_bybit_price(sym)
+                        s     = BOT_STATES[sym]
+                        price = fetch_price(sym)
                         if price is None:
                             continue
 
-                        c   = df.iloc[-1]
-                        atr = c["atr"]
-
-                        logger.info(
-                            "%s $%.2f | EMA↑=%s ST=%s RSI=%.1f MACD=%+.4f",
-                            sym, price,
-                            c["ema_fast"] > c["ema_mid"] > c["ema_slow"],
-                            c["st_dir"] == 1,
-                            c["rsi"], c["macd_h"],
-                        )
-
-                        s = BOT_STATES[sym]
-
-                        if s.get("pos") and check_exits(pair, price):
+                        # Загрузить 4H свечи и рассчитать индикаторы
+                        df4h = fetch_klines(sym, "240", 200)
+                        if df4h is None or len(df4h) < 60:
+                            logger.warning("%s: недостаточно данных", sym)
                             continue
+                        df4h = calc_indicators(df4h)
 
-                        trend_4h = get_4h_trend(sym)
-                        sig      = get_signal(df, trend_4h)
+                        # Проверить выходы из текущей позиции
+                        if s.get("pos"):
+                            exited = check_exits(pair, price, df4h)
+                            if exited:
+                                continue
 
-                        if sig == "BUY":
-                            t = do_buy(pair, price, atr)
+                        # Искать новый сигнал
+                        trend_1d = get_daily_trend(sym)
+                        sig      = get_signal(df4h, trend_1d)
+                        c        = df4h.iloc[-1]
+                        atr      = c["atr"]
+
+                        if sig and not s.get("pos"):
+                            t = do_open(pair, price, atr, sig)
                             if t:
-                                logger.info("%s ПОКУПКА @ $%.2f  SL=$%.2f TP=$%.2f",
-                                            sym, price, t["sl"], t["tp"])
+                                icon = "📈" if sig == "LONG" else "📉"
+                                logger.info("%s %s @ $%.2f  SL=%.2f  TP=%.2f",
+                                            sym, sig, price, t["sl"], t["tp"])
                                 send(ADMIN_ID,
-                                     f"📈 <b>ВХОД | {pair['emoji']} {pair['name']}</b>\n"
+                                     f"{icon} <b>ВХОД {sig} | {pair['emoji']} {pair['name']}</b>\n"
                                      f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                     f"💵 Цена входа:   <b>${fmt(price)}</b>\n"
-                                     f"🛡 Стоп-лосс:    <b>${fmt(t['sl'])}</b>\n"
-                                     f"🎯 Тейк-профит:  <b>${fmt(t['tp'])}</b>\n"
-                                     f"📊 RSI: {c['rsi']:.1f} | "
-                                     f"Supertrend: {'🟢 Бычий' if c['st_dir']==1 else '🔴 Медвежий'}\n"
-                                     f"📈 Тренд 4H: {'🟢 Бычий' if trend_4h==1 else '⚪ Нейтральный'}\n"
-                                     f"💰 Риск: 2% | R:R = 1:2\n"
+                                     f"💵 Цена входа:  <b>${fmt(price)}</b>\n"
+                                     f"⛔ Стоп-лосс:   <b>${fmt(t['sl'])}</b>\n"
+                                     f"🎯 Тейк-профит: <b>${fmt(t['tp'])}</b>\n"
+                                     f"📊 RSI: {c['rsi']:.0f} | "
+                                     f"ST: {'🟢 Бычий' if c['st_dir']==1 else '🔴 Медвежий'}\n"
+                                     f"📅 1D тренд: {'📈 Бычий' if trend_1d>0 else '📉 Медвежий' if trend_1d<0 else '↔️ Нейтральный'}\n"
+                                     f"⚖️ Риск: {RISK_PCT}% | R:R = 1:2 | Плечо: {LEVERAGE}x\n"
                                      f"🕐 {ts()}")
-
-                        elif sig == "SELL" and s.get("pos"):
-                            t = do_sell(pair, price, "SIGNAL")
-                            if t:
-                                pnl  = t["pnl"]
-                                icon = "✅" if pnl >= 0 else "❌"
-                                logger.info("%s ВЫХОД @ $%.2f  PnL=$%.2f", sym, price, pnl)
-                                send(ADMIN_ID,
-                                     f"{icon} <b>ВЫХОД | {pair['emoji']} {pair['name']}</b>\n"
-                                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                                     f"Вход: ${fmt(t['entry'])} → Выход: ${fmt(price)}\n"
-                                     f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code>\n"
-                                     f"Баланс бота: <b>${fmt(BOT_STATES[sym]['usdt'])}</b>\n"
-                                     f"🕐 {ts()}")
+                        elif not sig:
+                            trend_lbl = "📈" if trend_1d > 0 else "📉" if trend_1d < 0 else "↔️"
+                            logger.info("%s нет сигнала | RSI=%.0f ST=%d Trend1D=%s",
+                                        sym, c["rsi"], c["st_dir"], trend_lbl)
 
                     except Exception as e:
-                        logger.error("Цикл %s: %s", pair["symbol"], e)
+                        logger.error("Анализ %s: %s", sym, e)
+
                     time.sleep(2)
 
-                if check_num % 24 == 0:
+                # Каждые 12 итераций (2 дня на 4H) — сводка
+                if check_num % 12 == 0:
                     screen_stats(ADMIN_ID)
 
+            # Еженедельный отчёт
             if now - last_report >= 86400 * 7:
                 last_report = now
-                weekly_report()
+                trades  = all_trades()
+                closes  = [t for t in trades if t.get("action") == "CLOSE"]
+                week    = [t for t in closes if True]  # все доступные
+                pnl_w   = sum(t.get("pnl", 0) for t in week[-50:])
+                wins_w  = sum(1 for t in week[-50:] if t.get("pnl", 0) >= 0)
+                total_w = min(len(week), 50)
+                send(ADMIN_ID,
+                     f"📅 <b>Еженедельный отчёт</b>\n"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                     f"Сделок: {total_w} | WR: {wr_calc(wins_w, total_w - wins_w)}%\n"
+                     f"P&L:    <code>{sign(pnl_w)}${fmt(abs(pnl_w))}</code>\n"
+                     f"🕐 {ts()}")
 
         except KeyboardInterrupt:
-            logger.info("Остановка...")
+            logger.info("Остановка торгового цикла...")
             break
         except Exception as e:
             logger.error("Главный цикл: %s", e)
-            time.sleep(10)
+            time.sleep(30)
 
         time.sleep(CMD_INT)
+
+# ─── TELEGRAM POLLING ─────────────────────────────────────────────────────────
+
+def poll_telegram():
+    """Telegram long-polling в отдельном потоке"""
+    import threading
+    offset = 0
+
+    def _poll():
+        nonlocal offset
+        logger.info("Telegram polling запущен...")
+        while True:
+            try:
+                upds = api("getUpdates", {"offset": offset, "timeout": 30, "limit": 10})
+                for u in upds.get("result", []):
+                    offset = u["update_id"] + 1
+                    try:
+                        process_update(u)
+                    except Exception as e:
+                        logger.error("process_update: %s", e)
+            except Exception as e:
+                logger.error("polling: %s", e)
+                time.sleep(5)
+
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
+    return t
+
+# ─── ТОЧКА ВХОДА ──────────────────────────────────────────────────────────────
+
+def run():
+    if not TOKEN:
+        logger.warning("TELEGRAM_BOT_TOKEN не задан — Telegram отключён")
+    if not ADMIN_ID:
+        logger.warning("TELEGRAM_CHAT_ID не задан")
+    if LIVE_MODE:
+        logger.info("🟢 LIVE режим: Bybit %s", "Testnet" if USE_TESTNET else "Mainnet")
+        bal = get_bybit_balance()
+        if bal is not None:
+            logger.info("💳 Баланс Bybit USDT: $%.2f", bal)
+        else:
+            logger.warning("Не удалось получить баланс с Bybit — проверьте API ключи")
+    else:
+        logger.info("🎮 DEMO режим — торговля симулируется")
+
+    if TOKEN:
+        poll_telegram()
+        if ADMIN_ID:
+            mode_lbl = f"🟢 LIVE Bybit ({'Testnet' if USE_TESTNET else 'Mainnet'})" if LIVE_MODE else "🎮 DEMO"
+            send(ADMIN_ID,
+                 f"🚀 <b>CryptoBot Pro v5 запущен!</b>\n"
+                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                 f"⚡ Режим: {mode_lbl}\n"
+                 f"📊 Стратегия: EMA21/50 + Supertrend + RSI/MACD\n"
+                 f"⏱ Таймфрейм: 4H + 1D фильтр\n"
+                 f"🎯 Цель: 70-100% годовых\n"
+                 f"🕐 {ts()}")
+
+    trading_loop()
 
 
 if __name__ == "__main__":
