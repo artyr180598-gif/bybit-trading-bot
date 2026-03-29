@@ -976,8 +976,11 @@ def update_trailing(pair, price):
                     pos["sl"]     = be_sl
                     pos["trail_sl"] = be_sl
             else:
-                be_sl = round(entry - BE_BUFFER * atr, 2)
-                if be_sl < pos["sl"]:          # только если улучшаем SL
+                # SHORT: SL находится ВЫШЕ входа.
+                # Безубыток → entry + буфер (чуть выше входа, не ниже!).
+                # Если цена откатится обратно вверх — выйдем с небольшим плюсом.
+                be_sl = round(entry + BE_BUFFER * atr, 2)
+                if be_sl < pos["sl"]:          # улучшаем SL, сдвигая вниз ближе к входу
                     pos["sl"]     = be_sl
                     pos["trail_sl"] = be_sl
             pos["be_done"] = True
