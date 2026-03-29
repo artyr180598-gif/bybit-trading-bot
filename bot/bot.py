@@ -1416,7 +1416,6 @@ def pool_release(pair_name, pnl, is_win):
             d["loss"]          = d.get("loss", 0) + 1
             d["streak_loss"]   = d.get("streak_loss", 0) + 1
             d["streak_win"]    = 0
-        prev_balance = returned - user_pnl   # баланс до этой сделки ≈ pair_locked
         if d["balance"] > d.get("peak", 0):
             d["peak"] = d["balance"]
         # Максимальная просадка демо-счёта
@@ -1432,9 +1431,10 @@ def pool_release(pair_name, pnl, is_win):
         # Проверяем достижения (только при росте баланса)
         MILESTONES = [1100, 1250, 1500, 2000, 3000, 5000]
         if user_pnl > 0:
+            balance_before = d["balance"] - user_pnl   # баланс ДО начисления P&L
             for ms in MILESTONES:
                 # Баланс ПЕРЕСЁК milestone снизу вверх
-                if (returned - user_pnl) < ms <= d["balance"]:
+                if balance_before < ms <= d["balance"]:
                     try:
                         send(uid,
                              f"🏆 <b>Достижение!</b>\n"
