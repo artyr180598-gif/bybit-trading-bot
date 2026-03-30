@@ -1,10 +1,10 @@
 """
 CryptoBot Pro v5 — Автоматическая торговля (Demo + Live)
 ═══════════════════════════════════════════════════════════════
-СТРАТЕГИЯ: Scoring 3/4 — EMA + Supertrend + RSI + MACD (4H + 1D)
+СТРАТЕГИЯ: Scoring 3/4 — EMA + Supertrend + RSI + MACD (1H + 1D)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Рынок:     USDT Perpetual Futures (BTC, ETH, SOL)
-Таймфрейм: 4H свечи, анализ каждые 15 минут
+Рынок:     USDT Perpetual Futures (BTC, ETH, SOL, BNB, XRP)
+Таймфрейм: 1H свечи + 1D режим, анализ каждые 5 минут
 Плечо:     3x (настраивается через env LEVERAGE)
 
 ВХОД LONG (3 из 4 индикаторов):
@@ -83,6 +83,8 @@ PAIRS = [
     {"symbol": "BTCUSDT", "name": "BTC", "emoji": "₿",  "min_qty": 0.001},
     {"symbol": "ETHUSDT", "name": "ETH", "emoji": "Ξ",  "min_qty": 0.01},
     {"symbol": "SOLUSDT", "name": "SOL", "emoji": "◎",  "min_qty": 0.1},
+    {"symbol": "BNBUSDT", "name": "BNB", "emoji": "🔶", "min_qty": 0.01},
+    {"symbol": "XRPUSDT", "name": "XRP", "emoji": "💧", "min_qty": 1.0},
 ]
 
 # ─── МОНЕТЫ ДЛЯ ДЕМО-ТОРГОВЛИ ─────────────────────────────────────────────────
@@ -119,7 +121,7 @@ RISK_PCT     = 2.0    # 2% риска на сделку
 MAX_POS      = 3
 DAY_LOSS_PCT = 15.0   # дневной лимит потерь (% от капитала)
 GLOBAL_DD    = 30.0   # максимальная просадка от пика (%)
-TRADE_INT    = 900     # анализ каждые 15 минут (4H свечи — чаще нет смысла)
+TRADE_INT    = 300     # анализ каждые 5 минут (1H свечи — новая свеча каждый час)
 SL_CHECK_INT = 60      # проверка SL/TP каждую минуту (только fetch_price — дёшево)
 SL_COOLDOWN  = 4 * 3600  # 4 часа паузы по паре после стоп-лосса (нет реванш-трейдов)
 CMD_INT      = 3
@@ -1864,7 +1866,7 @@ def screen_main(cid):
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"⚡ Режим: {mode_str}{bybit_bal}\n"
             f"📊 Стратегия: EMA21/50 + Supertrend + RSI/MACD\n"
-            f"⏱ Таймфрейм: 4H + 1D фильтр | Плечо: {LEVERAGE}x\n\n"
+            f"⏱ Таймфрейм: 1H + 1D фильтр | Плечо: {LEVERAGE}x\n\n"
             f"👋 Привет, <b>{user['name']}</b>!\n\n"
             f"{demo_line}"
             f"💼 Реальный: <b>${fmt(r['balance'])}</b>  <code>{sign(r_pct)}{r_pct:.1f}%</code>\n\n"
@@ -1890,7 +1892,7 @@ def screen_strategy(cid):
     pair_lines = ""
     for pair in PAIRS:
         try:
-            df   = fetch_klines(pair["symbol"], "240", 80)
+            df   = fetch_klines(pair["symbol"], "60", 80)
             if df is not None and len(df) >= 60:
                 df    = calc_indicators(df)
                 trend = get_daily_trend(pair["symbol"])
@@ -1920,7 +1922,7 @@ def screen_strategy(cid):
         "  ↔️ <b>Флэт</b> — EMAs переплетены\n"
         "     → торгуем только при идеальных 4 из 4\n\n"
         "🔍 <b>4 индикатора для входа:</b>\n"
-        "  • EMA21/50 — структура тренда на 4H\n"
+        "  • EMA21/50 — структура тренда на 1H\n"
         "  • Supertrend — динамическое направление\n"
         f"  • RSI — импульс (LONG: {RSI_LONG_MIN}–{RSI_LONG_MAX}, SHORT: {RSI_SHORT_MIN}–{RSI_SHORT_MAX})\n"
         "  • MACD — гистограмма на правильной стороне нуля\n\n"
@@ -2006,7 +2008,7 @@ def screen_market(cid):
         price = fetch_price(pair["symbol"])
         s     = BOT_STATES.get(pair["symbol"], {})
         pos   = s.get("pos")
-        df4h  = fetch_klines(pair["symbol"], "240", 80)
+        df4h  = fetch_klines(pair["symbol"], "60", 80)
         sig_txt = ""
         if df4h is not None and len(df4h) >= 60:
             df4h   = calc_indicators(df4h)
@@ -3154,8 +3156,8 @@ def trading_loop():
                         if price is None:
                             continue
 
-                        # Загрузить 4H свечи и рассчитать индикаторы
-                        df4h = fetch_klines(sym, "240", 200)
+                        # Загрузить 1H свечи и рассчитать индикаторы
+                        df4h = fetch_klines(sym, "60", 200)
                         if df4h is None or len(df4h) < 60:
                             logger.warning("%s: недостаточно данных", sym)
                             continue
@@ -3408,7 +3410,7 @@ def run():
                  f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                  f"⚡ Режим: {mode_lbl}\n"
                  f"📊 Стратегия: EMA21/50 + Supertrend + RSI/MACD\n"
-                 f"⏱ Таймфрейм: 4H + 1D фильтр\n"
+                 f"⏱ Таймфрейм: 1H + 1D фильтр\n"
                  f"🎯 Цель: 70-100% годовых\n"
                  f"🕐 {ts()}")
 
