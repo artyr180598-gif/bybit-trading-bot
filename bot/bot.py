@@ -394,7 +394,7 @@ def demo_close_pos(user, symbol):
     usdt   = pos["usdt"]
     side   = pos["side"]
 
-    # P&L с учётом плеча
+    # P&amp;L с учётом плеча
     if side == "LONG":
         pnl = (exit_price - entry) / entry * usdt * lev
     else:
@@ -402,7 +402,7 @@ def demo_close_pos(user, symbol):
 
     pnl = round(pnl, 4)
 
-    # Возвращаем вложенные + P&L
+    # Возвращаем вложенные + P&amp;L
     d["balance"] = round(d["balance"] + usdt + pnl, 4)
     if d["balance"] > d.get("peak", d["balance"]):
         d["peak"] = d["balance"]
@@ -435,7 +435,7 @@ def demo_close_pos(user, symbol):
 
 
 def demo_float_pnl(pos):
-    """Плавающий P&L позиции (без закрытия)"""
+    """Плавающий P&amp;L позиции (без закрытия)"""
     coin = demo_coin_by_symbol(pos["symbol"])
     price, _ = fetch_demo_price(pos["symbol"], coin.get("cg_id") if coin else None)
     if not price:
@@ -1122,7 +1122,7 @@ def check_exits(pair, price, df4h):
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Вход: <b>${fmt(pos['entry'])}</b> → Выход: <b>${fmt(price)}</b>\n"
                 f"⏱ Время в позиции: {dur}\n"
-                f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code> "
+                f"P&amp;L: <code>{sign(pnl)}${fmt(abs(pnl))}</code> "
                 f"({sign(t['pnl_pct'])}{t['pnl_pct']:.1f}%)\n"
                 f"⏸ Пауза по {pair['name']}: 4ч (следующий вход после {resume_str})\n"
                 f"🕐 {ts()}"
@@ -1141,7 +1141,7 @@ def check_exits(pair, price, df4h):
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Вход: <b>${fmt(pos['entry'])}</b> → Выход: <b>${fmt(price)}</b>\n"
                 f"⏱ Время в позиции: {dur}\n"
-                f"P&L: <code>+${fmt(pnl)}</code> "
+                f"P&amp;L: <code>+${fmt(pnl)}</code> "
                 f"({sign(t['pnl_pct'])}{t['pnl_pct']:.1f}%)\n"
                 f"🕐 {ts()}"
             )
@@ -1160,7 +1160,7 @@ def check_exits(pair, price, df4h):
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Вход: ${fmt(pos['entry'])} → Выход: ${fmt(price)}\n"
                 f"⏱ Время в позиции: {dur}\n"
-                f"P&L: <code>{sign(pnl)}${fmt(abs(pnl))}</code>\n"
+                f"P&amp;L: <code>{sign(pnl)}${fmt(abs(pnl))}</code>\n"
                 f"🕐 {ts()}"
             )
             notify_all_users(msg, critical=True)
@@ -1425,7 +1425,7 @@ def distribute(pair_name, pnl, is_win):
             icon = "✅" if is_win else "❌"
             send(uid,
                  f"{icon} <b>{pair_name}</b> — сделка закрыта\n"
-                 f"P&L: <code>{sign(user_pnl)}${fmt(abs(user_pnl))}</code>\n"
+                 f"P&amp;L: <code>{sign(user_pnl)}${fmt(abs(user_pnl))}</code>\n"
                  f"Баланс: <b>${fmt(r['balance'])}</b>")
     save_users(users)
 
@@ -1481,7 +1481,7 @@ def pool_lock(pair_name, margin):
 
 def pool_release(pair_name, pnl, is_win):
     """
-    Разморозить locked средства ТОЛЬКО для данной пары + распределить P&L.
+    Разморозить locked средства ТОЛЬКО для данной пары + распределить P&amp;L.
     Это позволяет правильно работать когда одновременно открыто 2–3 позиции:
     закрытие BTC не разморозит деньги, заложенные под ETH или SOL.
     """
@@ -1552,7 +1552,7 @@ def pool_release(pair_name, pnl, is_win):
         # Проверяем достижения (только при росте баланса)
         MILESTONES = [1100, 1250, 1500, 2000, 3000, 5000]
         if user_pnl > 0:
-            balance_before = d["balance"] - user_pnl   # баланс ДО начисления P&L
+            balance_before = d["balance"] - user_pnl   # баланс ДО начисления P&amp;L
             for ms in MILESTONES:
                 # Баланс ПЕРЕСЁК milestone снизу вверх
                 if balance_before < ms <= d["balance"]:
@@ -1839,7 +1839,7 @@ def screen_main(cid):
         else:
             demo_line = f"🎮 Демо:     <b>${fmt(d['balance'])}</b>  <code>{sign(d_pct)}{d_pct:.1f}%</code>\n"
 
-        # Открытые позиции бота с плавающим P&L
+        # Открытые позиции бота с плавающим P&amp;L
         bot_pos_lines = ""
         unreal_pnl    = 0.0
         for pair in PAIRS:
@@ -1874,10 +1874,10 @@ def screen_main(cid):
         if bot_pos_lines:
             text += f"{bot_pos_lines}\n"
             if unreal_pnl != 0:
-                text += f"  Нереализованный P&L: <code>{sign(unreal_pnl)}${fmt(abs(unreal_pnl))}</code>\n"
+                text += f"  Нереализованный P&amp;L: <code>{sign(unreal_pnl)}${fmt(abs(unreal_pnl))}</code>\n"
         text += (
             f"\n  Закрыто сделок: {total_trade} (WR: {wr}%)\n"
-            f"  Реализованный P&L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
+            f"  Реализованный P&amp;L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
         )
         send(cid, text, kb_main())
     except Exception as e:
@@ -1945,8 +1945,8 @@ def screen_stats(cid):
     losses  = [t for t in closes if t.get("pnl", 0) < 0]
     total_n = len(closes)
     total_pnl = sum(t.get("pnl", 0) for t in closes)
-    win_avg = sum(t["pnl"] for t in wins)   / max(len(wins), 1)
-    loss_avg= sum(t["pnl"] for t in losses) / max(len(losses), 1)
+    win_avg = sum(t.get("pnl", 0) for t in wins)   / max(len(wins), 1)
+    loss_avg= sum(t.get("pnl", 0) for t in losses) / max(len(losses), 1)
     wr      = wr_calc(len(wins), len(losses))
     rr      = abs(win_avg / loss_avg) if loss_avg != 0 else 0
 
@@ -1956,8 +1956,8 @@ def screen_stats(cid):
     # Лучшая и худшая сделка
     best_t  = max(closes, key=lambda t: t.get("pnl", 0), default=None)
     worst_t = min(closes, key=lambda t: t.get("pnl", 0), default=None)
-    best_str  = (f"{best_t.get('pair','?')} <code>+${fmt(best_t['pnl'])}</code>")  if best_t  else "—"
-    worst_str = (f"{worst_t.get('pair','?')} <code>-${fmt(abs(worst_t['pnl']))}</code>") if worst_t else "—"
+    best_str  = (f"{best_t.get('pair','?')} <code>+${fmt(best_t.get('pnl',0))}</code>")  if best_t  else "—"
+    worst_str = (f"{worst_t.get('pair','?')} <code>-${fmt(abs(worst_t.get('pnl',0)))}</code>") if worst_t else "—"
 
     pos_text = ""
     for pair in PAIRS:
@@ -1982,7 +1982,7 @@ def screen_stats(cid):
         f"  Long / Short:     {len(longs)} / {len(shorts)}\n"
         f"  Победных:         {len(wins)} ({wr}%)\n"
         f"  Убыточных:        {len(losses)}\n"
-        f"  Суммарный P&L:    <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
+        f"  Суммарный P&amp;L:    <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
         f"  Средний выигрыш:  ${fmt(win_avg)}\n"
         f"  Средний убыток:   ${fmt(abs(loss_avg))}\n"
         f"  R:R:              {rr:.2f}\n"
@@ -2119,7 +2119,7 @@ def screen_demo_trade(cid):
     pct    = pct_val(profit, d.get("start", 1000))
     wr     = wr_calc(d["wins"], d["loss"])
 
-    # Подсчитать плавающий P&L бота (долю пользователя)
+    # Подсчитать плавающий P&amp;L бота (долю пользователя)
     total_locked_pool = sum(
         u["demo"].get("locked", 0) for u in load_users().values()
     )
@@ -2149,7 +2149,7 @@ def screen_demo_trade(cid):
         fl_str = f"<code>{sign(user_float)}${fmt(abs(user_float))}</code>"
         text += (
             f"🔒 В торговле:     <b>${fmt(locked)}</b>\n"
-            f"📊 Float P&L:      {fl_str}\n"
+            f"📊 Float P&amp;L:      {fl_str}\n"
         )
     text += (
         f"💼 Итого капитал:  <b>${fmt(total)}</b>\n"
@@ -2197,7 +2197,7 @@ def screen_demo_trade(cid):
             direction = "📈" if p["side"] == "LONG" else "📉"
             text += (
                 f"  {direction} {p['emoji']} <b>{p['short']}</b> {p['side']}"
-                f" × {p['lev']}x | Вход: ${fmt(p['entry'])} | P&L: {fl_str}\n"
+                f" × {p['lev']}x | Вход: ${fmt(p['entry'])} | P&amp;L: {fl_str}\n"
             )
 
     send(cid, text, kb_demo_trade(poss))
@@ -2258,7 +2258,7 @@ def screen_demo_select_amount(cid, side, symbol):
 
 
 def screen_demo_positions(cid):
-    """Экран открытых позиций с P&L и кнопками закрытия"""
+    """Экран открытых позиций с P&amp;L и кнопками закрытия"""
     user  = get_user(cid)
     poss  = demo_get_positions(user)
 
@@ -2282,7 +2282,7 @@ def screen_demo_positions(cid):
             f"   Вход:   ${fmt(p['entry'])}\n"
             f"   Сейчас: {cur_str}  ({sign(chg_pct)}{chg_pct:.2f}%)\n"
             f"   Сумма:  ${fmt(p['usdt'])} → эффект. ${fmt(p['usdt']*p['lev'])}\n"
-            f"   P&L:    <b><code>{fl_str}</code></b>\n"
+            f"   P&amp;L:    <b><code>{fl_str}</code></b>\n"
             f"   Дата:   {p['ts']}\n\n"
         )
 
@@ -2432,7 +2432,7 @@ def screen_mode_info(cid):
         text += (
             f"\n\n📈 Закрытых сделок: {len(closes)}\n"
             f"🏆 Винрейт: {wr}%\n"
-            f"💹 Суммарный P&L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>"
+            f"💹 Суммарный P&amp;L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>"
         )
 
         if bal is None:
@@ -2529,7 +2529,7 @@ def screen_admin(cid):
         f"👥 Пользователей: {total_users}\n"
         f"💰 Всего внесено: ${fmt(total_dep)}\n"
         f"📊 Сделок закрыто: {len(closes)}\n"
-        f"💹 Суммарный P&L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
+        f"💹 Суммарный P&amp;L: <code>{sign(total_pnl)}${fmt(abs(total_pnl))}</code>\n"
         f"📌 Открытых позиций: {active_positions()}/{MAX_POS}"
     )
     send(cid, text, kb_admin())
@@ -2960,7 +2960,7 @@ def process_update(update):
                      "Вы будете получать только важные уведомления:\n"
                      "• Открытие позиции\n"
                      "• Закрытие / SL / TP\n"
-                     "• Личный P&L при закрытии\n"
+                     "• Личный P&amp;L при закрытии\n"
                      "• Достижения и милстоуны\n\n"
                      "Часовые сводки рынка отключены.",
                      kb_back())
@@ -2992,12 +2992,20 @@ def handle_admin_cb(cid, data):
     elif data == "adm_trades":
         trades = all_trades()
         closes = [t for t in trades if t.get("action") == "CLOSE"][-10:]
-        text   = "📋 <b>Последние сделки</b>\n\n"
-        for t in reversed(closes):
-            pnl  = t.get("pnl", 0)
-            icon = "✅" if pnl >= 0 else "❌"
-            text += f"{icon} {t.get('pair')} {t.get('side')} {sign(pnl)}${fmt(abs(pnl))}\n"
-        send(cid, text or "Нет сделок", kb_back())
+        if not closes:
+            send(cid,
+                 "📋 <b>Последние сделки</b>\n"
+                 "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                 "Закрытых сделок пока нет.\n"
+                 "История появится после первой закрытой позиции.",
+                 kb_back())
+        else:
+            text = "📋 <b>Последние сделки</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for t in reversed(closes):
+                pnl  = t.get("pnl", 0)
+                icon = "✅" if pnl >= 0 else "❌"
+                text += f"{icon} <b>{t.get('pair','?')}</b> {t.get('side','?')} → {sign(pnl)}${fmt(abs(pnl))}\n"
+            send(cid, text, kb_back())
     elif data == "adm_broadcast":
         PENDING_INPUTS[cid] = "broadcast"
         send(cid, "✏️ Введите текст рассылки:", kb_back())
@@ -3269,7 +3277,7 @@ def trading_loop():
                      f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                      f"Сделок за неделю: {total_w}\n"
                      f"WR: {wr_calc(wins_w, total_w - wins_w)}%\n"
-                     f"P&L: <code>{sign(pnl_w)}${fmt(abs(pnl_w))}</code>\n"
+                     f"P&amp;L: <code>{sign(pnl_w)}${fmt(abs(pnl_w))}</code>\n"
                      f"Капитал бота: ${fmt(total_eq)}\n"
                      f"🕐 {ts()}")
 
@@ -3298,7 +3306,7 @@ def trading_loop():
                              f"({sign(pct)}{pct:.1f}%)\n"
                              f"📊 Сделок всего: <b>{trades}</b> | "
                              f"WR: <b>{wr}%</b>\n"
-                             f"💹 Суммарный P&L: <code>{sign(profit)}${fmt(abs(profit))}</code>\n"
+                             f"💹 Суммарный P&amp;L: <code>{sign(profit)}${fmt(abs(profit))}</code>\n"
                              f"📌 Открытых позиций: <b>{active_pos}/{MAX_POS}</b>\n\n"
                              f"{trend} Бот работает 24/7. Следующие сделки уже на подходе.\n"
                              f"🕐 {ts()}")
