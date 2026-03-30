@@ -1760,6 +1760,7 @@ def kb_admin():
         [{"text": "📢 Рассылка",     "callback_data": "adm_broadcast"},
          {"text": "📋 Все сделки",   "callback_data": "adm_trades"}],
         [{"text": "🔄 Сброс CB",     "callback_data": "adm_reset_cb"}],
+        [{"text": "♻️ Сброс ДЕМО всех", "callback_data": "adm_reset_all_demo"}],
         [{"text": "🏠 Главное меню", "callback_data": "menu"}],
     ]
 
@@ -3021,6 +3022,71 @@ def handle_admin_cb(cid, data):
              f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
              f"{result_text}",
              kb_admin())
+
+    elif data == "adm_reset_all_demo":
+        if not is_admin(cid):
+            return
+        users   = load_users()
+        n_users = len(users)
+        send(cid,
+             f"♻️ <b>Сброс ДЕМО-баланса всех пользователей</b>\n"
+             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+             f"Это действие сбросит демо-счёт <b>{n_users}</b> пользователей:\n"
+             f"  • Баланс → $1,000\n"
+             f"  • Статистика (сделки, винрейт) → 0\n"
+             f"  • Замороженные средства → 0\n\n"
+             f"⚠️ Действие необратимо. Подтверждаешь?",
+             [[{"text": "✅ Да, сбросить всем",  "callback_data": "adm_reset_all_confirm"},
+               {"text": "❌ Отмена",             "callback_data": "adm_panel"}]])
+
+    elif data == "adm_reset_all_confirm":
+        if not is_admin(cid):
+            return
+        users     = load_users()
+        count     = 0
+        notified  = 0
+        for uid, user in users.items():
+            d = user.get("demo", {})
+            d["positions"]     = []
+            d["balance"]       = 1000.0
+            d["start"]         = 1000.0
+            d["peak"]          = 1000.0
+            d["profit"]        = 0.0
+            d["trades"]        = 0
+            d["wins"]          = 0
+            d["loss"]          = 0
+            d["history"]       = []
+            d["streak_win"]    = 0
+            d["streak_loss"]   = 0
+            d["locked"]        = 0.0
+            d["locked_by_pair"]= {}
+            d["max_dd"]        = 0.0
+            user["demo"]       = d
+            save_user(uid, user)
+            count += 1
+            # Уведомить пользователя
+            try:
+                send(uid,
+                     "♻️ <b>Демо-баланс сброшен администратором</b>\n"
+                     "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                     "Начинаем с чистого листа!\n"
+                     "Новый стартовый баланс: <b>$1,000</b>\n\n"
+                     "Бот работает с обновлённой стратегией. Удачи! 🚀")
+                notified += 1
+            except Exception:
+                pass
+        send(cid,
+             f"✅ <b>Готово!</b>\n"
+             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+             f"Сброшено: <b>{count}</b> пользователей\n"
+             f"Уведомлено: <b>{notified}</b>\n"
+             f"Все балансы → <b>$1,000</b>",
+             kb_admin())
+
+    elif data == "adm_panel":
+        if not is_admin(cid):
+            return
+        screen_admin(cid)
 
 # ─── ГЛАВНЫЙ ТОРГОВЫЙ ЦИКЛ ────────────────────────────────────────────────────
 
