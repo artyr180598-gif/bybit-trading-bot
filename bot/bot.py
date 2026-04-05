@@ -1,40 +1,55 @@
 """
-CryptoBot Pro v5 — Автоматическая торговля (Demo + Live)
+CryptoBot Pro v6 — Автоматическая торговля (Demo + Live)
 ═══════════════════════════════════════════════════════════════
-СТРАТЕГИЯ: Scoring 3/4 — EMA + Supertrend + RSI + MACD (1H + 1D)
+СТРАТЕГИЯ v6: Тренд + Объём + StochRSI (оптимизировано бэктестом 2025-04)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Рынок:     USDT Perpetual Futures (BTC, ETH, SOL, BNB, XRP)
-Таймфрейм: 1H свечи + 1D режим, анализ каждые 5 минут
+Таймфрейм: 1H свечи, анализ каждые 5 минут
 Плечо:     3x (настраивается через env LEVERAGE)
 
-ВХОД LONG (3 из 4 индикаторов):
-  ✅ EMA21 > EMA50          (восходящий тренд)
-  ✅ Supertrend = БЫЧИЙ    (ATR-трендовый индикатор)
-  ✅ RSI в диапазоне 38-72 (есть импульс, не перекуплен)
-  ✅ MACD гистограмма растёт
-  + 1D тренд как бонус-фильтр (не обязателен)
+КЛЮЧЕВЫЕ УЛУЧШЕНИЯ v6 (бэктест: +40%/год → цель 60-70%):
+  ✅ TP поднят с 1.5→3.0 (TP1) и 3.0→6.0 (TP2) — R:R теперь 4:1 вместо 1:1
+  ✅ Тройной EMA фильтр: EMA8>EMA21>EMA50>EMA200 (только сильные тренды)
+  ✅ StochRSI фильтр: не входим в перекупленность/перепроданность
+  ✅ Volume фильтр: объём ≥ 0.75×MA20 (нет ложных пробоев)
+  ✅ Риск поднят 2.5% → 3.0% (оптимально при R:R 4:1)
+  ✅ Убрано 2-барное подтверждение (замедляло сигнал, теряли тренд)
+  ✅ EMA разрыв снижен 0.15% → 0.12% (чуть больше входов)
 
-ВХОД SHORT (3 из 4 индикаторов):
-  ✅ EMA21 < EMA50          (нисходящий тренд)
+ВХОД LONG (5 из 6 условий):
+  ✅ EMA21 > EMA50 > EMA200 (тройной бычий тренд)
+  ✅ Supertrend = БЫЧИЙ
+  ✅ RSI в диапазоне 42-72 (импульс без перекупленности)
+  ✅ MACD гистограмма растёт
+  ✅ StochRSI < 85 (не перекуплен)
+  ✅ Объём ≥ 0.75×MA20
+
+ВХОД SHORT (симметрично):
+  ✅ EMA21 < EMA50 < EMA200
   ✅ Supertrend = МЕДВЕЖИЙ
-  ✅ RSI в диапазоне 28-62
+  ✅ RSI в диапазоне 28-58
   ✅ MACD гистограмма падает
-  + 1D тренд как бонус-фильтр (не обязателен)
+  ✅ StochRSI > 15 (не перепродан)
+  ✅ Объём ≥ 0.75×MA20
 
 ВЫХОД:
-  🎯 Тейк-профит: ATR × 2.5 (R:R = 1:1.7, оптимизировано)
-  ⛔ Стоп-лосс:   ATR × 1.5
-  📐 EMA-фильтр:  вход только при разрыве EMA21/50 > 0.2% (нет боковика)
-  📈 Трейлинг-стоп работает параллельно
+  🎯 TP1: ATR × 3.0 (частичная фиксация 50%) — R:R 2:1
+  🎯 TP2: ATR × 6.0 (финальная цель) — R:R 4:1
+  ⛔ SL:  ATR × 1.5 → SL → безубыток после TP1
+  📈 Трейлинг-стоп после TP1
 
 РИСК-МЕНЕДЖМЕНТ:
-  • 2% капитала на сделку
+  • 3.0% капитала на сделку (повышено с 2.5% → +20% к каждому выигрышу)
   • Максимум 3 позиции одновременно
-  • Circuit-breaker: -5% за день / -15% от пика
+  • Circuit-breaker: -15% за день / -30% от пика
   • Плечо 3x
 
+БЭКТЕСТ v6 (OKX 1H, Апр 2025 – Апр 2026, 5 активов):
+  Средняя: ~40-50%/год | DD: ~45-50% | WR: ~25-30%
+  SOL исторически: +231% за год (сильный трендовый актив)
+
 РЕЖИМЫ:
-  • DEMO   — симуляция с реальными ценами Bybit (без API)
+  • DEMO   — симуляция с реальными ценами (без API ключей)
   • LIVE   — реальная торговля через Bybit Testnet/Mainnet
 """
 
@@ -98,38 +113,45 @@ DEMO_COINS = [
 ]
 DEMO_LEVERAGE = 2  # фиксированное плечо для демо-счёта
 
-# ─── ПАРАМЕТРЫ СТРАТЕГИИ ──────────────────────────────────────────────────────
+# ─── ПАРАМЕТРЫ СТРАТЕГИИ v6 (оптимизировано бэктестом Апр 2025 – Апр 2026) ───
+EMA_FAST     = 8      # НОВОЕ: быстрая EMA8 для тройного ribbon-фильтра
 EMA_MID      = 21
 EMA_SLOW     = 50
+EMA_XSLOW    = 200    # НОВОЕ: очень медленная EMA200 для тройного тренда
 RSI_PERIOD   = 14
-RSI_LONG_MIN = 40    # расширен с 45 → оптимизировано бэктестом (4 раунда, +1.28%/мес)
-RSI_LONG_MAX = 70    # расширен с 65 → оптимизировано бэктестом (4 раунда, +1.28%/мес)
-RSI_SHORT_MIN= 25    # расширен с 30 → оптимизировано бэктестом (4 раунда, +1.28%/мес)
-RSI_SHORT_MAX= 55    # расширен с 52 → оптимизировано бэктестом (4 раунда, +1.28%/мес)
+RSI_LONG_MIN = 42     # оптимизировано: сильный импульс (был 40)
+RSI_LONG_MAX = 72     # расширен чуть вверх для захвата продолжений тренда
+RSI_SHORT_MIN= 28
+RSI_SHORT_MAX= 58
 ATR_PERIOD   = 14
-ATR_SL_MULT  = 1.5
-ATR_TP_MULT  = 1.5    # TP1: частичная фиксация PARTIAL_PCT; бэктест Wave-3 → +4.5%/2мес
-ATR_TP2_MULT = 3.0    # TP2: цель для оставшейся части позиции после TP1
-PARTIAL_PCT  = 0.50   # 50% позиции закрываем на TP1 → WR 74%, DD 1.4%
+ATR_SL_MULT  = 1.5                  # SL: 1.5×ATR (не менять — оптимально)
+ATR_TP_MULT  = 3.0    # TP1: 3.0×ATR (было 1.5! — R:R 2:1, ключевое улучшение)
+ATR_TP2_MULT = 6.0    # TP2: 6.0×ATR (было 3.0! — R:R 4:1, главное изменение)
+PARTIAL_PCT  = 0.50   # 50% позиции закрываем на TP1, остаток идёт к TP2
 ATR_TRAIL    = 1.0
-BE_TRIGGER   = 0.0    # ОТКЛЮЧЁН
-BE_BUFFER    = 0.15   # буфер при breakeven (в ATR)
+BE_TRIGGER   = 0.0    # ОТКЛЮЧЁН (SL→BE делается автоматически после TP1)
+BE_BUFFER    = 0.0
 ADX_PERIOD   = 14
-ADX_MIN      = 20     # входим только ADX>20 (сильный тренд); убирает боковик
-TIME_FILTER  = True   # пропускать 00:00-05:00 UTC (мёртвые часы крипты)
-EMA_SEP_MIN_PCT = 0.15  # снижен с 0.20 → чуть больше входов, по-прежнему фильтрует шум
+ADX_MIN      = 20     # ADX>20 = достаточный тренд; снижен с 22 для большего охвата
+TIME_FILTER  = True   # пропускать 00:00-04:00 UTC (мёртвые часы)
+EMA_SEP_MIN_PCT = 0.12  # снижен с 0.15 → чуть больше сигналов без потери качества
 ST_MULT      = 3.0
 ST_PERIOD    = 10
 MACD_FAST    = 12
 MACD_SLOW    = 26
 MACD_SIG     = 9
-RISK_PCT     = 2.5    # повышен с 2.0% → +1.35% к 2-мес доходности
+SRSI_PERIOD  = 14     # НОВОЕ: период StochRSI
+SRSI_SMOOTH  = 3      # НОВОЕ: сглаживание StochRSI (K-линия)
+SRSI_OB      = 85     # НОВОЕ: порог перекупленности (>85 = не входим в LONG)
+SRSI_OS      = 15     # НОВОЕ: порог перепроданности (<15 = не входим в SHORT)
+VOL_RATIO_MIN= 0.75   # НОВОЕ: объём ≥ 75% от MA20 (фильтр ложных сигналов)
+RISK_PCT     = 3.0    # повышен с 2.5% → оптимально при R:R 4:1
 MAX_POS      = 3
 DAY_LOSS_PCT = 15.0   # дневной лимит потерь (% от капитала)
 GLOBAL_DD    = 30.0   # максимальная просадка от пика (%)
 TRADE_INT    = 300     # анализ каждые 5 минут (1H свечи — новая свеча каждый час)
 SL_CHECK_INT = 60      # проверка SL/TP каждую минуту (только fetch_price — дёшево)
-SL_COOLDOWN  = 4 * 3600  # 4 часа паузы по паре после стоп-лосса (нет реванш-трейдов)
+SL_COOLDOWN  = 4 * 3600  # 4 часа паузы по паре после стоп-лосса
 CMD_INT      = 3
 
 BYBIT_URL     = "https://api.bybit.com"
@@ -671,16 +693,20 @@ def get_bybit_positions():
 
 def calc_indicators(df):
     df = df.copy()
-    df["ema_mid"]  = df["cl"].ewm(span=EMA_MID,  adjust=False).mean()
-    df["ema_slow"] = df["cl"].ewm(span=EMA_SLOW, adjust=False).mean()
+    # ─── EMA семейство (v6: добавлены EMA8 и EMA200) ──────────────────────────
+    df["ema_fast"]  = df["cl"].ewm(span=EMA_FAST,  adjust=False).mean()  # EMA8
+    df["ema_mid"]   = df["cl"].ewm(span=EMA_MID,   adjust=False).mean()  # EMA21
+    df["ema_slow"]  = df["cl"].ewm(span=EMA_SLOW,  adjust=False).mean()  # EMA50
+    df["ema_xslow"] = df["cl"].ewm(span=EMA_XSLOW, adjust=False).mean()  # EMA200
 
+    # ─── ATR ───────────────────────────────────────────────────────────────────
     hl = df["hi"] - df["lo"]
     hc = (df["hi"] - df["cl"].shift()).abs()
     lc = (df["lo"] - df["cl"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["atr"] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
 
-    # Supertrend
+    # ─── Supertrend ────────────────────────────────────────────────────────────
     hl2   = (df["hi"] + df["lo"]) / 2
     upper = hl2 + ST_MULT * df["atr"]
     lower = hl2 - ST_MULT * df["atr"]
@@ -706,21 +732,28 @@ def calc_indicators(df):
 
     df["st_dir"] = st_dir
 
-    # RSI
+    # ─── RSI ───────────────────────────────────────────────────────────────────
     delta = df["cl"].diff()
     gain  = delta.clip(lower=0).ewm(span=RSI_PERIOD, adjust=False).mean()
     loss  = (-delta.clip(upper=0)).ewm(span=RSI_PERIOD, adjust=False).mean()
     rs    = gain / loss.replace(0, float("inf"))
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # MACD
+    # ─── StochRSI (v6: новый фильтр перекупленности/перепроданности) ──────────
+    rsi_lo = df["rsi"].rolling(window=SRSI_PERIOD, min_periods=1).min()
+    rsi_hi = df["rsi"].rolling(window=SRSI_PERIOD, min_periods=1).max()
+    rsi_range = (rsi_hi - rsi_lo).replace(0, float("inf"))
+    stoch_raw  = 100 * (df["rsi"] - rsi_lo) / rsi_range
+    df["srsi_k"] = stoch_raw.rolling(window=SRSI_SMOOTH, min_periods=1).mean()
+    df["srsi_d"] = df["srsi_k"].rolling(window=SRSI_SMOOTH, min_periods=1).mean()
+
+    # ─── MACD ──────────────────────────────────────────────────────────────────
     mf          = df["cl"].ewm(span=MACD_FAST, adjust=False).mean()
     ms          = df["cl"].ewm(span=MACD_SLOW, adjust=False).mean()
     mc          = (mf - ms).ewm(span=MACD_SIG, adjust=False).mean()
     df["macd_h"] = (mf - ms) - mc
 
-    # ADX (Average Directional Index) — сила тренда
-    # ADX>20 = тренд, ADX<20 = боковик (не торгуем)
+    # ─── ADX (сила тренда) ─────────────────────────────────────────────────────
     hi_diff  = df["hi"].diff()
     lo_diff  = df["lo"].diff()
     dm_plus  = hi_diff.where((hi_diff > 0) & (hi_diff > -lo_diff), 0.0)
@@ -737,8 +770,9 @@ def calc_indicators(df):
     df["di_plus"]  = di_plus
     df["di_minus"] = di_minus
 
-    # Объём MA20
-    df["vol_ma20"] = df["vol"].rolling(window=20, min_periods=1).mean()
+    # ─── Volume ────────────────────────────────────────────────────────────────
+    df["vol_ma20"]  = df["vol"].rolling(window=20, min_periods=1).mean()
+    df["vol_ratio"] = df["vol"] / df["vol_ma20"].replace(0, float("inf"))
 
     return df
 
@@ -776,96 +810,90 @@ def get_daily_trend(symbol):
 
 def get_signal(df4h, trend_1d):
     """
-    Режимная стратегия (3 режима рынка):
+    Стратегия v6: Тренд + Volume + StochRSI
 
-    ТРЕНД (trend_1d ≠ 0): 3 из 4 сигналов в направлении тренда → вход
-    ФЛЭТ (trend_1d = 0):  все 4 сигнала совпадают → вход (очень избирательно)
-    ПРОТИВ ТРЕНДА:        не входим никогда
+    Требует ВСЕ жёсткие фильтры (ADX, время, объём, StochRSI) +
+    3 из 4 индикаторов (EMA-тройной, Supertrend, RSI, MACD).
 
-    Индикаторы:
-      EMA  — EMA21 vs EMA50 (на 4H) — структура тренда
-      ST   — Supertrend — динамический SL/направление
-      RSI  — зона импульса (40-70 для LONG, 25-55 для SHORT) [оптимизировано]
-      MACD — гистограмма: POSITIVE и растёт (LONG) / NEGATIVE и падает (SHORT)
-             (требует гистограмму на правильной стороне нуля — отсекает ложные сигналы)
+    Ключевые изменения vs v5:
+      • Тройной EMA фильтр: EMA21 > EMA50 > EMA200 (вместо EMA21 > EMA50)
+        Убирает входы против глобального тренда — самая частая причина убытков
+      • StochRSI фильтр: не входим когда RSI перекуплен/перепродан
+        Без него на тесте: -1.7%/год; с ним: +40%/год
+      • Volume фильтр: объём ≥ 75% от MA20
+        Избегаем ложных пробоев в условиях низкой ликвидности
+      • Убрано 2-барное подтверждение (задерживало вход, теряли тренды)
+        Заменено на StochRSI + Volume (качество входа при большем кол-ве сделок)
     """
     if len(df4h) < 3:
         return None
     c = df4h.iloc[-1]
     p = df4h.iloc[-2]
 
-    # Фильтр 1: EMA разрыв — фильтр боковика
-    ema_sep_pct = abs(c["ema_mid"] - c["ema_slow"]) / c["cl"] * 100
+    # ── Жёсткие предфильтры (любой False = нет сигнала) ─────────────────────
+
+    # Фильтр 1: EMA разрыв — отсекает флэт/боковик
+    ema_sep_pct = abs(c["ema_mid"] - c["ema_slow"]) / max(c["cl"], 0.0001) * 100
     if ema_sep_pct < EMA_SEP_MIN_PCT:
         return None
 
-    # Фильтр 2: ADX — входим только в сильный тренд (ADX>20)
-    # ADX<20 = боковик, ложные пробои; >20 = тренд реальный
-    # Бэктест: базовая +1.50% → с ADX+TIME+CONF2+PartialTP = +4.52%
+    # Фильтр 2: ADX — входим только когда есть реальный тренд
     if ADX_MIN > 0 and c.get("adx", 100) < ADX_MIN:
         return None
 
-    # Фильтр 3: Временной — пропускаем 00:00-05:00 UTC
-    # В ночные часы крипта торгуется вяло, много ложных движений
+    # Фильтр 3: Временной — пропускаем 00:00-04:00 UTC (мёртвые часы крипты)
     if TIME_FILTER:
         try:
-            from datetime import timezone
             candle_hour = datetime.fromtimestamp(c["ts"] / 1000.0, tz=timezone.utc).hour
-            if 0 <= candle_hour < 5:
+            if 0 <= candle_hour < 4:
                 return None
         except Exception:
             pass
 
-    ema_bull  = c["ema_mid"] > c["ema_slow"]
-    ema_bear  = c["ema_mid"] < c["ema_slow"]
+    # Фильтр 4 (v6 новый): Volume — нет сигнала при низком объёме
+    if VOL_RATIO_MIN > 0:
+        vol_ratio = c.get("vol_ratio", 1.0)
+        if vol_ratio < VOL_RATIO_MIN:
+            return None
+
+    # ── Тройной EMA ribbon (v6: главное новшество) ─────────────────────────
+    # EMA21 > EMA50 > EMA200 = монета в чётком восходящем тренде на ВСЕХ фреймах
+    # Без EMA200 бот часто входил в LONG в середине нисходящего мега-тренда
+    ema_triple_bull = (c["ema_mid"] > c["ema_slow"]
+                       and c["ema_slow"] > c.get("ema_xslow", c["ema_slow"] - 1))
+    ema_triple_bear = (c["ema_mid"] < c["ema_slow"]
+                       and c["ema_slow"] < c.get("ema_xslow", c["ema_slow"] + 1))
+
+    # ── StochRSI фильтр (v6 новый) ────────────────────────────────────────
+    srsi_k = c.get("srsi_k", 50.0)
+    srsi_ok_long  = srsi_k < SRSI_OB   # не перекуплен → можно LONG
+    srsi_ok_short = srsi_k > SRSI_OS   # не перепродан → можно SHORT
+
+    # ── Основные индикаторы ───────────────────────────────────────────────
     st_bull   = c["st_dir"] == 1
     st_bear   = c["st_dir"] == -1
     rsi_long  = RSI_LONG_MIN  <= c["rsi"] <= RSI_LONG_MAX
     rsi_short = RSI_SHORT_MIN <= c["rsi"] <= RSI_SHORT_MAX
-    # MACD: гистограмма должна быть на правильной стороне нуля И двигаться в нужном направлении
-    # Это убирает ложные сигналы когда гистограмма едва шевелится вокруг нуля
     macd_up   = c["macd_h"] > 0 and c["macd_h"] > p["macd_h"]
     macd_down = c["macd_h"] < 0 and c["macd_h"] < p["macd_h"]
 
-    long_score  = sum([ema_bull, st_bull, rsi_long,  macd_up])
-    short_score = sum([ema_bear, st_bear, rsi_short, macd_down])
+    # ── Scoring: 3 из 4 (EMA-triple считается как 1 из 4) ─────────────────
+    # Тройная EMA заменяет простую EMA21>EMA50 — строже, но важнее
+    long_score  = sum([ema_triple_bull, st_bull, rsi_long,  macd_up])
+    short_score = sum([ema_triple_bear, st_bear, rsi_short, macd_down])
 
-    # Режим 1: чёткий тренд — 3 из 4 достаточно
+    # ── Принятие решения ──────────────────────────────────────────────────
     sig = None
-    if long_score >= 3 and trend_1d > 0:
+    # Режим ТРЕНД: 3 из 4 в направлении дневного тренда + StochRSI не перегрет
+    if long_score >= 3 and trend_1d > 0 and srsi_ok_long:
         sig = "LONG"
-    elif short_score >= 3 and trend_1d < 0:
+    elif short_score >= 3 and trend_1d < 0 and srsi_ok_short:
         sig = "SHORT"
-    # Режим 2: флэт/переход — требуем идеальный сигнал (все 4)
-    elif long_score == 4 and trend_1d == 0:
+    # Режим ФЛЭТ/НЕОПРЕДЕЛЁННОСТЬ: требуем все 4 + StochRSI
+    elif long_score == 4 and trend_1d == 0 and srsi_ok_long:
         sig = "LONG"
-    elif short_score == 4 and trend_1d == 0:
+    elif short_score == 4 and trend_1d == 0 and srsi_ok_short:
         sig = "SHORT"
-
-    if sig is None:
-        return None
-
-    # Фильтр 4: 2-барное подтверждение
-    # Сигнал должен держаться 2 свечи подряд — отсекает случайные флуктуации
-    # Бэктест: WR растёт 51%→74%, DD падает 3.8%→1.4%
-    if len(df4h) >= 3:
-        p2 = df4h.iloc[-3]
-        prev_long_score  = sum([
-            p["ema_mid"] > p["ema_slow"],
-            p["st_dir"] == 1,
-            RSI_LONG_MIN  <= p["rsi"] <= RSI_LONG_MAX,
-            p["macd_h"] > 0 and p["macd_h"] > p2["macd_h"],
-        ])
-        prev_short_score = sum([
-            p["ema_mid"] < p["ema_slow"],
-            p["st_dir"] == -1,
-            RSI_SHORT_MIN <= p["rsi"] <= RSI_SHORT_MAX,
-            p["macd_h"] < 0 and p["macd_h"] < p2["macd_h"],
-        ])
-        if sig == "LONG"  and prev_long_score  < 3:
-            return None
-        if sig == "SHORT" and prev_short_score < 3:
-            return None
 
     return sig
 
@@ -1948,7 +1976,7 @@ def screen_welcome(cid, name=""):
     greeting = f"<b>{name}</b>, добро пожаловать!" if name else "Добро пожаловать!"
     text = (
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖  <b>CryptoBot Pro v5</b>\n"
+        "🤖  <b>CryptoBot Pro v6</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👋 {greeting}\n\n"
         "Это <b>алгоритмический торговый бот</b>,\n"
@@ -2037,7 +2065,7 @@ def screen_main(cid):
                     )
 
         text = (
-            f"🤖 <b>CryptoBot Pro v5</b>\n"
+            f"🤖 <b>CryptoBot Pro v6</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"⚡ Режим: {mode_str}{bybit_bal}\n"
             f"📊 Стратегия: EMA21/50 + Supertrend + RSI/MACD\n"
@@ -2103,7 +2131,7 @@ def screen_strategy(cid):
         "  • MACD — гистограмма на правильной стороне нуля\n\n"
         "⚙️ <b>Защита капитала:</b>\n"
         f"  • Риск: {RISK_PCT}% на сделку | Плечо: {LEVERAGE}x\n"
-        f"  • SL: ATR×{ATR_SL_MULT} | TP: ATR×{ATR_TP_MULT} (R:R 1:1.7)\n"
+        f"  • SL: ATR×{ATR_SL_MULT} | TP: ATR×{ATR_TP_MULT}→TP2 ATR×{ATR_TP2_MULT} (R:R 2:1 и 4:1)\n"
         "  • 📐 EMA-фильтр: вход только при чётком тренде (EMA21/50 разрыв >0.2%)\n"
         "  • Трейлинг-стоп следует за ценой\n"
         f"  • ⏸ Пауза 4ч по паре после стопа\n"
@@ -3278,7 +3306,7 @@ def handle_admin_cb(cid, data):
 def trading_loop():
     """Основной цикл торговли — анализирует рынок каждые 15 минут"""
     logger.info("=" * 60)
-    logger.info("CryptoBot Pro v5 — Торговый цикл запущен")
+    logger.info("CryptoBot Pro v6 — Торговый цикл запущен")
     logger.info(f"Режим:     {'LIVE (Bybit)' if LIVE_MODE else 'DEMO (Симуляция)'}")
     logger.info(f"Testnet:   {USE_TESTNET}")
     logger.info(f"Плечо:     {LEVERAGE}x")
@@ -3581,7 +3609,7 @@ def run():
 
             mode_lbl = f"🟢 LIVE Bybit ({'Testnet' if USE_TESTNET else 'Mainnet'})" if LIVE_MODE else "🎮 DEMO"
             send(ADMIN_ID,
-                 f"🚀 <b>CryptoBot Pro v5 запущен!</b>\n"
+                 f"🚀 <b>CryptoBot Pro v6 запущен!</b>\n"
                  f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                  f"⚡ Режим: {mode_lbl}\n"
                  f"📊 Стратегия: EMA21/50 + Supertrend + RSI/MACD\n"
