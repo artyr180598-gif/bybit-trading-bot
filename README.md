@@ -14,12 +14,11 @@ Multi-user Telegram trading bot with demo & real accounts, deposit/withdraw flow
 
 ## Strategy
 
-- EMA 50/200 trend filter
-- Williams %R oversold entry
-- MACD histogram crossover confirmation
-- RSI filter (40–65 buy zone, ≥75 exit)
-- Dynamic ATR ×1.5 stop-loss
-- Pairs: BTC, ETH, SOL — 30-minute timeframe — 2% risk per trade
+- Adaptive multi-profile strategy selection at startup (backtest over last 365 days)
+- Profiles: `balanced`, `momentum`, `mean_reversion`, `defensive`
+- Indicators core: EMA trend structure + Supertrend + RSI zone filter + MACD histogram direction
+- Dynamic ATR-based SL/TP/Trailing and position sizing by risk
+- Daily trend regime filter and strong-trend validation (ADX)
 
 ## Setup
 
