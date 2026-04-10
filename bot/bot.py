@@ -2154,6 +2154,7 @@ def kb_admin():
          {"text": "📊 Статистика",   "callback_data": "adm_stats"}],
         [{"text": "💰 Депозиты",     "callback_data": "adm_deposits"},
          {"text": "💸 Выводы",       "callback_data": "adm_withdrawals"}],
+        [{"text": "📌 Долг",         "callback_data": "adm_debt"}],
         [{"text": "📢 Рассылка",     "callback_data": "adm_broadcast"},
          {"text": "📋 Все сделки",   "callback_data": "adm_trades"}],
         [{"text": "🔄 Сброс CB",     "callback_data": "adm_reset_cb"}],
@@ -3387,6 +3388,8 @@ def handle_admin_cb(cid, data):
         total  = sum(u["real"]["deposited"] for u in users.values())
         active = sum(1 for u in users.values() if u["real"]["active"])
         send(cid, f"💰 Депозиты\nВсего внесено: ${fmt(total)}\nАктивных: {active}", kb_back())
+    elif data == "adm_debt":
+        send(cid, "📌 Раздел «Долг» скоро будет доступен.", kb_back())
     elif data == "adm_trades":
         trades = all_trades()
         closes = [t for t in trades if t.get("action") == "CLOSE"][-10:]
