@@ -1,68 +1,69 @@
-# CryptoBot Pro — Bybit Trading Bot
+# SiteGuard Bot — анализатор сайтов на уязвимости
 
-Multi-user Telegram trading bot with demo & real accounts, deposit/withdraw flow, admin panel, and automatic profit distribution. Trades BTC, ETH, SOL in paper mode.
+Telegram-бот, который проверяет сайты на типовые проблемы безопасности и
+присылает понятный отчёт с оценкой (A–F) и рекомендациями «как починить».
+Подходит для аудита собственных сайтов и сайтов клиентов (с их разрешения).
 
-## Features
+Все проверки **безопасные**: бот только читает то, что сайт сам отдаёт. Он не
+перебирает пароли, не внедряет данные, не ломает и не нагружает сайт.
 
-- **Demo account** — $1,000 virtual per user, same strategy as real
-- **Real account** — deposit USDT TRC20, bot trades and distributes profits
-- **Profit distribution** — each trade's P&L split proportionally across all active investors
-- **Deposit flow** — user selects amount → gets wallet address → sends TXID → admin confirms
-- **Withdrawal flow** — user requests → admin approves and pays
-- **Admin panel** — `/admin` command: view users, pending deposits/withdrawals, bot stats
-- **Inline buttons** — fully menu-driven, no commands needed for users
+## Что проверяет
 
-## Strategy
+- 🔐 **SSL/TLS** — валидность и срок сертификата, редирект HTTP → HTTPS
+- 📋 **Заголовки безопасности** — HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
+- 🍪 **Cookies** — флаги Secure, HttpOnly, SameSite
+- 📂 **Открытые файлы** — `.git`, `.env`, бэкапы, дампы БД, `phpinfo`, `server-status`
+- 📁 **Листинг директорий**
+- 📧 **Защита почты** — записи SPF и DMARC (защита от подделки писем)
+- ℹ️ **Прочее** — утечка версий ПО, опасная политика CORS, анализ `robots.txt`
 
-- EMA 50/200 trend filter
-- Williams %R oversold entry
-- MACD histogram crossover confirmation
-- RSI filter (40–65 buy zone, ≥75 exit)
-- Dynamic ATR ×1.5 stop-loss
-- Pairs: BTC, ETH, SOL — 30-minute timeframe — 2% risk per trade
+Каждая находка имеет уровень критичности (🔴 критическая … ⚪ информация),
+объяснение простыми словами и шаги по устранению.
 
-## Setup
+## Архитектура
 
-1. Clone the repo
-2. Install dependencies:
-   ```
+```
+bot/
+├── bot.py       # Telegram: команды, приём адресов, отправка отчётов
+├── scanner.py   # Движок проверок — добавляйте свои проверки сюда
+└── report.py    # Сборка читаемого отчёта для Telegram
+```
+
+Добавить свою проверку просто: напишите функцию `check_xxx(ctx)` в `scanner.py`
+и добавьте её в список `CHECKS`. Движок сам её вызовет.
+
+## Установка и запуск
+
+1. Создайте бота у [@BotFather](https://t.me/BotFather) и получите токен.
+2. Установите зависимости:
+   ```bash
    pip install -r requirements.txt
    ```
-3. Set environment variables:
+3. Задайте переменные окружения:
 
-   | Variable | Description |
+   | Переменная | Описание |
    |---|---|
-   | `TELEGRAM_BOT_TOKEN` | Your bot token from @BotFather |
-   | `TELEGRAM_CHAT_ID` | Your Telegram chat ID (admin) |
-   | `BYBIT_API_KEY` | Bybit API key |
-   | `BYBIT_API_SECRET` | Bybit API secret |
-   | `USDT_WALLET` | Your TRC20 USDT wallet for deposits |
-   | `ADMIN_IDS` | Comma-separated admin chat IDs (defaults to `TELEGRAM_CHAT_ID`) |
+   | `TELEGRAM_BOT_TOKEN` | Токен бота от @BotFather (обязательно) |
+   | `TELEGRAM_CHAT_ID` | ID чата администратора — уведомление о старте (необязательно) |
 
-4. Run:
-   ```
+4. Запустите:
+   ```bash
    python bot/bot.py
    ```
 
-## Telegram User Commands
+На Railway запуск настроен через `Procfile` (`worker: python bot/bot.py`) —
+достаточно задать `TELEGRAM_BOT_TOKEN` в Variables.
 
-- `/start` — open main menu
-- `/admin` — admin panel (admins only)
+## Как пользоваться
 
-## Admin Actions
+1. Откройте бота в Telegram, отправьте `/start`, примите условия.
+2. Пришлите адрес сайта: `example.com` или `https://example.com`
+   (или командой `/scan example.com`).
+3. Через 10–30 секунд придёт отчёт с оценкой и списком проблем.
 
-- Confirm deposits
-- Pay withdrawal requests
-- View all users and balances
-- View bot trading stats
+## ⚠️ Правовая оговорка
 
-## Data
-
-All state saved to `data/` folder:
-- `users.json` — all user accounts
-- `bot_trades.jsonl` — trade log
-- `{SYM}_state.json` — per-pair bot state
-
-## Note
-
-Runs in **paper trading** mode by default. Real money is never traded — profit/loss is simulated and distributed to user accounts for demonstration purposes.
+Сканируйте только сайты, которыми **владеете**, или на которые у вас есть
+**письменное разрешение** владельца. Запуск проверок против чужих ресурсов без
+согласия может быть незаконным. Бот делает только безопасные проверки, но
+ответственность за их применение лежит на пользователе.

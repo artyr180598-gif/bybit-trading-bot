@@ -1,23 +1,22 @@
-# CryptoBot Pro v5
+# SiteGuard Bot
 
-Telegram-бот для торговли на Bybit с поддержкой демо-режима.
+Telegram-бот для анализа сайтов на типовые уязвимости. Безопасные проверки —
+не ломают и не нагружают сайт.
 
-## Стратегия
+## Файлы
 
-EMA Crossover + Supertrend + RSI + MACD (4H + 1D)
+| Файл | Назначение |
+|---|---|
+| `bot.py` | Общение с Telegram (команды, отправка ответов) |
+| `scanner.py` | Движок проверок (SSL, заголовки, открытые файлы и т.д.) |
+| `report.py` | Оформление результата в отчёт |
 
 ## Переменные окружения
 
 | Переменная | Описание |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | Токен Telegram бота |
-| `TELEGRAM_CHAT_ID` | ID чата администратора |
-| `ADMIN_IDS` | ID администраторов (через запятую) |
-| `USDT_WALLET` | Кошелёк USDT TRC-20 для пополнений |
-| `BYBIT_API_KEY` | API ключ Bybit (для LIVE режима) |
-| `BYBIT_API_SECRET` | API секрет Bybit (для LIVE режима) |
-| `BYBIT_TESTNET` | `true` = тестовая сеть, `false` = основная |
-| `BYBIT_LEVERAGE` | Плечо (по умолчанию: 3) |
+| `TELEGRAM_BOT_TOKEN` | Токен Telegram-бота от @BotFather (обязательно) |
+| `TELEGRAM_CHAT_ID` | ID чата администратора (необязательно — для уведомления о старте) |
 
 ## Запуск
 
@@ -26,7 +25,14 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-## Режимы
+## Проверки
 
-- **DEMO** — симуляция с реальными ценами (без API ключей)
-- **LIVE** — реальная торговля через Bybit Testnet/Mainnet
+- SSL-сертификат (валидность, срок), редирект HTTP→HTTPS
+- Заголовки безопасности: HSTS, CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy
+- Флаги cookies: Secure, HttpOnly, SameSite
+- Открытые чувствительные файлы: `.git`, `.env`, бэкапы, дампы БД, `phpinfo`
+- Листинг директорий
+- Защита почты от подделки: SPF, DMARC
+- Утечка версий ПО, политика CORS, анализ `robots.txt`
+
+⚠️ Сканируйте только свои сайты или с письменного разрешения владельца.
